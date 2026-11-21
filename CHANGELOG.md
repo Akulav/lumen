@@ -7,6 +7,12 @@ pushed to `main`, GitHub Actions tags, builds and publishes the release.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-21
+
+### Changed
+- Settings are split into tabs – General, Engine, Chat, Web & MCP, Shortcuts, About – so each part fits on one screen
+  instead of one long scrolling page. The tab bar stays at the top and the chosen tab is kept while you change settings.
+
 ## [0.16.1] - 2026-11-21
 
 ### Fixed

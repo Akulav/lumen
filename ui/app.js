@@ -1209,59 +1209,74 @@ function renderSettings() {
   const sel = (key, opts) => `<select class="inp" data-k="${key}">${opts.map(([v, l]) => `<option value="${v}" ${String(s[key]) === String(v) ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
   const sw = (key) => `<label class="switch"><input type="checkbox" data-k="${key}" ${s[key] ? "checked" : ""}/><span></span></label>`;
   const f = (label, hint, ctrl) => `<div class="field"><div><label>${label}</label>${hint ? `<small>${hint}</small>` : ""}</div>${ctrl}</div>`;
-  let html = `<h2>${t("settings")}</h2>`;
-  if (S.needsReload && S.info.model) html += `<div class="setup-card" style="margin-top:12px;flex-direction:row;align-items:center"><span style="flex:1">${icon("refresh")} ${t("reloadHint")}</span><button class="btn primary" id="reloadBtn">${t("reload")}</button></div>`;
-  html += `<h3>${icon("globe")}Language / Limbă</h3>`;
-  html += f(t("uiLang"), "", sel("ui_lang", [["en", "English"], ["ro", "Română"]]));
-  html += f(t("replyLang"), t("replyLangHint"), sel("reply_lang", [["auto", t("auto")], ["en", "English"], ["ro", "Română"]]));
-  html += `<h3>${icon("chip")}${t("engine")}</h3>`;
-  // (macOS has one llama.cpp build, Metal: runtime.rs `effective_backend`)
-  // an NVIDIA card (named once a model has loaded) gets CUDA as the recommendation
-  const nvidia = /nvidia|geforce|quadro|tesla|rtx/i.test(S.info.gpu_name || "");
-  const backends = S.os === "macos" ? [["metal", t("metalRec")], ["cpu", t("cpuOnly")]]
-    : nvidia ? [["cuda", t("cudaRec")], ["vulkan", "Vulkan"], ["rocm", t("rocmAmd")], ["cpu", t("cpuOnly")]]
-    : [["vulkan", t("vulkanRec")], ["rocm", t("rocmAmd")], ["cuda", t("cudaNvidia")], ["cpu", t("cpuOnly")]];
-  html += f(t("backend"), S.os === "macos" ? t("backendHintMac") : t("backendHint"), sel("backend", backends));
-  html += f(t("runtimeVer"), esc(S.runtime || "—"), `<button class="btn" id="updRt">${icon("download")}${t("update")}</button>`);
-  html += f(t("ctxSize"), t("ctxSizeHint"), sel("ctx_size", [[0, t("auto")], [8192, "8k"], [16384, "16k"], [32768, "32k"], [65536, "64k"], [131072, "128k"], [262144, "256k"]]));
-  html += f(t("kv"), t("kvHint"), sel("kv_cache", [["q8_0", "q8_0"], ["f16", "f16"], ["q4_0", "q4_0"]]));
-  html += f(t("idleUnload"), t("idleUnloadHint"), sel("idle_unload_min", [[0, t("never")], [5, "5 min"], [15, "15 min"], [30, "30 min"], [60, "1 h"], [120, "2 h"]]));
-  html += f(t("moe"), t("moeHint"), `<input class="inp" style="min-width:90px;width:90px" type="number" min="0" max="99" data-k="n_cpu_moe" value="${s.n_cpu_moe}"/>`);
-  html += `<h3>${icon("sparkle")}${t("chatSection")}</h3>`;
-  html += `<div class="field col"><div><label>${t("customInstr")}</label><small>${t("customInstrHint")}</small></div><textarea class="inp" data-k="custom_instructions" placeholder="${esc(t("customInstrPh"))}">${esc(s.custom_instructions || "")}</textarea></div>`;
-  html += f(t("temp"), `<span id="tempV">${(+s.temperature).toFixed(2)}</span>`, `<input type="range" min="0" max="1.5" step="0.05" data-k="temperature" value="${s.temperature}"/>`);
-  html += f(t("compressAt"), `<span id="compV">${Math.round(s.compress_at * 100)}%</span> · ${t("compressHint")}`, `<input type="range" min="0.4" max="0.9" step="0.02" data-k="compress_at" value="${s.compress_at}"/>`);
-  html += f(t("thinkDefault"), "", sw("thinking"));
-  html += f(t("semantic"), t("semanticHint"), sw("semantic_search"));
-  html += `<h3>${icon("globe")}${t("webSearch")}</h3>`;
-  html += f(t("searchProvider"), t("searchProviderHint"), sel("search_provider", [["duckduckgo", t("ddgNoKey")], ["wikipedia", t("wikiNoKey")], ["brave", "Brave Search API"], ["tavily", "Tavily"], ["searxng", t("searxSelf")]]));
-  if (s.search_provider === "brave" || s.search_provider === "tavily") {
-    const link = s.search_provider === "brave" ? "https://brave.com/search/api/" : "https://tavily.com/";
-    html += f(t("apiKey"), `<a href="${link}">${link}</a>`, `<input class="inp" type="password" data-k="search_key" value="${esc(s.search_key)}" placeholder="key"/>`);
+  const tab = SETTINGS_TABS.some(([id]) => id === S.settingsTab) ? S.settingsTab : "general";
+  let html = "";
+  if (tab === "general") {
+    html += `<h3>${icon("globe")}Language / Limbă</h3>`;
+    html += f(t("uiLang"), "", sel("ui_lang", [["en", "English"], ["ro", "Română"]]));
+    html += f(t("replyLang"), t("replyLangHint"), sel("reply_lang", [["auto", t("auto")], ["en", "English"], ["ro", "Română"]]));
+    html += `<h3>${icon("gear")}${t("appSection")}</h3>`;
+    html += f(t("tray"), t("trayHint"), sw("close_to_tray"));
+    html += f(t("autoload"), "", sw("autoload_model"));
+    html += f(t("dataFolder"), esc(S.root), `<button class="btn" id="openData">${icon("folder")}${t("open")}</button>`);
+    html += f(t("quit"), "", `<button class="btn danger" id="quitBtn">${icon("power")}${t("quit")}</button>`);
   }
-  if (s.search_provider === "searxng") html += f("SearXNG URL", t("searxHint"), `<input class="inp" data-k="searxng_url" value="${esc(s.searxng_url)}" placeholder="http://localhost:8080"/>`);
-  html += `<h3>${icon("plug")}${t("mcpSection")}</h3>`;
-  html += `<div class="field col"><div><label>${t("mcpLabel")}</label><small>${esc(t("mcpHint"))}</small></div><textarea class="inp mono" id="mcpConfig" spellcheck="false" placeholder="${esc(MCP_EXAMPLE)}">${esc(prettyJson(s.mcp_config))}</textarea><div class="btn-row"><button class="btn primary" id="mcpSave">${icon("check")}${t("mcpSave")}</button><button class="btn" id="mcpReconnect">${icon("refresh")}${t("mcpReconnect")}</button></div><div class="mcp-list" id="mcpList">${mcpListHtml()}</div></div>`;
-  html += `<h3>${icon("gear")}${t("appSection")}</h3>`;
-  html += f(t("tray"), t("trayHint"), sw("close_to_tray"));
-  html += f(t("autoload"), "", sw("autoload_model"));
-  html += f(t("dataFolder"), esc(S.root), `<button class="btn" id="openData">${icon("folder")}${t("open")}</button>`);
-  html += f(t("quit"), "", `<button class="btn danger" id="quitBtn">${icon("power")}${t("quit")}</button>`);
-  html += `<h3>${icon("bolt")}${t("shortcuts")}</h3><div class="shortcuts">${SHORTCUTS.map(([k, d]) => `<div><kbd>${k}</kbd><span>${t(d)}</span></div>`).join("")}</div>`;
-  html += `<h3>${icon("sparkle")}${t("about")}</h3><div class="about"><img src="logo.png" alt=""/><div><div class="ttl">Lumen v${esc(S.version)}</div><small>${t("madeBy")} Akulav · Tauri + Rust + llama.cpp ${esc(S.runtime || "")}</small></div></div>`;
-  const u = S.updates || {};
-  // both buttons: check any time, update when GitHub has a newer release (never for a copy built from source)
-  const upd = `<div class="btn-row">${u.app && !u.self_built ? `<button class="btn primary" id="installUpd" ${u.installing ? "disabled" : ""}>${icon("download")}${t("updateApp", { v: esc(u.app.version) })}</button>` : ""}<button class="btn" id="checkUpd" ${u.checking ? "disabled" : ""}>${u.checking ? '<span class="spinner"></span>' : icon("refresh")}${t("checkUpdates")}</button></div>`;
-  const status = (u.app ? t("updateAvailable", { v: esc(u.app.version) }) + (u.app.url ? ` · <a href="${esc(u.app.url)}">${t("releaseNotes")}</a>` : "")
-    : u.checked_at ? t("lastChecked", { x: esc(fmtTime(u.checked_at)) }) : t("notChecked")) + (u.self_built ? `<br>${t("selfBuilt")}` : "");
-  html += f(t("updates"), status + (u.error ? `<br><span style="color:var(--bad)">${esc(u.error)}</span>` : ""), upd);
-  if (u.runtime) html += f(t("runtimeVer"), t("runtimeAvailable", { a: esc(u.runtime_current || "—"), b: esc(u.runtime) }), `<button class="btn primary" id="rtUpd">${icon("download")}${t("update")}</button>`);
-  html += f(t("autoCheck"), t("autoCheckHint"), sw("check_updates"));
-  html += `<h3>${icon("list")}${t("logs")} <button class="btn ghost" id="logRef" style="margin-left:auto">${icon("refresh")}${t("refresh")}</button></h3><div class="logs" id="logs"></div>`;
-  $("#settingsPage").innerHTML = html;
-  loadLogs();
-  invoke("mcp_status").then((m) => { S.mcp = m; renderMcpList(); }).catch(() => {});
+  if (tab === "engine") {
+    // (macOS has one llama.cpp build, Metal: runtime.rs `effective_backend`)
+    // an NVIDIA card (named once a model has loaded) gets CUDA as the recommendation
+    const nvidia = /nvidia|geforce|quadro|tesla|rtx/i.test(S.info.gpu_name || "");
+    const backends = S.os === "macos" ? [["metal", t("metalRec")], ["cpu", t("cpuOnly")]]
+      : nvidia ? [["cuda", t("cudaRec")], ["vulkan", "Vulkan"], ["rocm", t("rocmAmd")], ["cpu", t("cpuOnly")]]
+      : [["vulkan", t("vulkanRec")], ["rocm", t("rocmAmd")], ["cuda", t("cudaNvidia")], ["cpu", t("cpuOnly")]];
+    html += f(t("backend"), S.os === "macos" ? t("backendHintMac") : t("backendHint"), sel("backend", backends));
+    html += f(t("runtimeVer"), esc(S.runtime || "—"), `<button class="btn" id="updRt">${icon("download")}${t("update")}</button>`);
+    html += f(t("ctxSize"), t("ctxSizeHint"), sel("ctx_size", [[0, t("auto")], [8192, "8k"], [16384, "16k"], [32768, "32k"], [65536, "64k"], [131072, "128k"], [262144, "256k"]]));
+    html += f(t("kv"), t("kvHint"), sel("kv_cache", [["q8_0", "q8_0"], ["f16", "f16"], ["q4_0", "q4_0"]]));
+    html += f(t("idleUnload"), t("idleUnloadHint"), sel("idle_unload_min", [[0, t("never")], [5, "5 min"], [15, "15 min"], [30, "30 min"], [60, "1 h"], [120, "2 h"]]));
+    html += f(t("moe"), t("moeHint"), `<input class="inp" style="min-width:90px;width:90px" type="number" min="0" max="99" data-k="n_cpu_moe" value="${s.n_cpu_moe}"/>`);
+  }
+  if (tab === "chat") {
+    html += `<div class="field col"><div><label>${t("customInstr")}</label><small>${t("customInstrHint")}</small></div><textarea class="inp" data-k="custom_instructions" placeholder="${esc(t("customInstrPh"))}">${esc(s.custom_instructions || "")}</textarea></div>`;
+    html += f(t("temp"), `<span id="tempV">${(+s.temperature).toFixed(2)}</span>`, `<input type="range" min="0" max="1.5" step="0.05" data-k="temperature" value="${s.temperature}"/>`);
+    html += f(t("compressAt"), `<span id="compV">${Math.round(s.compress_at * 100)}%</span> · ${t("compressHint")}`, `<input type="range" min="0.4" max="0.9" step="0.02" data-k="compress_at" value="${s.compress_at}"/>`);
+    html += f(t("thinkDefault"), "", sw("thinking"));
+    html += f(t("semantic"), t("semanticHint"), sw("semantic_search"));
+  }
+  if (tab === "tools") {
+    html += `<h3>${icon("globe")}${t("webSearch")}</h3>`;
+    html += f(t("searchProvider"), t("searchProviderHint"), sel("search_provider", [["duckduckgo", t("ddgNoKey")], ["wikipedia", t("wikiNoKey")], ["brave", "Brave Search API"], ["tavily", "Tavily"], ["searxng", t("searxSelf")]]));
+    if (s.search_provider === "brave" || s.search_provider === "tavily") {
+      const link = s.search_provider === "brave" ? "https://brave.com/search/api/" : "https://tavily.com/";
+      html += f(t("apiKey"), `<a href="${link}">${link}</a>`, `<input class="inp" type="password" data-k="search_key" value="${esc(s.search_key)}" placeholder="key"/>`);
+    }
+    if (s.search_provider === "searxng") html += f("SearXNG URL", t("searxHint"), `<input class="inp" data-k="searxng_url" value="${esc(s.searxng_url)}" placeholder="http://localhost:8080"/>`);
+    html += `<h3>${icon("plug")}${t("mcpSection")}</h3>`;
+    html += `<div class="field col"><div><label>${t("mcpLabel")}</label><small>${esc(t("mcpHint"))}</small></div><textarea class="inp mono" id="mcpConfig" spellcheck="false" placeholder="${esc(MCP_EXAMPLE)}">${esc(prettyJson(s.mcp_config))}</textarea><div class="btn-row"><button class="btn primary" id="mcpSave">${icon("check")}${t("mcpSave")}</button><button class="btn" id="mcpReconnect">${icon("refresh")}${t("mcpReconnect")}</button></div><div class="mcp-list" id="mcpList">${mcpListHtml()}</div></div>`;
+  }
+  if (tab === "keys") {
+    html += `<div class="shortcuts">${SHORTCUTS.map(([k, d]) => `<div><kbd>${k}</kbd><span>${t(d)}</span></div>`).join("")}</div>`;
+  }
+  if (tab === "about") {
+    html += `<div class="about"><img src="logo.png" alt=""/><div><div class="ttl">Lumen v${esc(S.version)}</div><small>${t("madeBy")} Akulav · Tauri + Rust + llama.cpp ${esc(S.runtime || "")}</small></div></div>`;
+    const u = S.updates || {};
+    // both buttons: check any time, update when GitHub has a newer release (never for a copy built from source)
+    const upd = `<div class="btn-row">${u.app && !u.self_built ? `<button class="btn primary" id="installUpd" ${u.installing ? "disabled" : ""}>${icon("download")}${t("updateApp", { v: esc(u.app.version) })}</button>` : ""}<button class="btn" id="checkUpd" ${u.checking ? "disabled" : ""}>${u.checking ? '<span class="spinner"></span>' : icon("refresh")}${t("checkUpdates")}</button></div>`;
+    const status = (u.app ? t("updateAvailable", { v: esc(u.app.version) }) + (u.app.url ? ` · <a href="${esc(u.app.url)}">${t("releaseNotes")}</a>` : "")
+      : u.checked_at ? t("lastChecked", { x: esc(fmtTime(u.checked_at)) }) : t("notChecked")) + (u.self_built ? `<br>${t("selfBuilt")}` : "");
+    html += f(t("updates"), status + (u.error ? `<br><span style="color:var(--bad)">${esc(u.error)}</span>` : ""), upd);
+    if (u.runtime) html += f(t("runtimeVer"), t("runtimeAvailable", { a: esc(u.runtime_current || "—"), b: esc(u.runtime) }), `<button class="btn primary" id="rtUpd">${icon("download")}${t("update")}</button>`);
+    html += f(t("autoCheck"), t("autoCheckHint"), sw("check_updates"));
+    html += `<h3>${icon("list")}${t("logs")} <button class="btn ghost" id="logRef" style="margin-left:auto">${icon("refresh")}${t("refresh")}</button></h3><div class="logs" id="logs"></div>`;
+  }
+  let head = `<h2>${t("settings")}</h2>`;
+  if (S.needsReload && S.info.model) head += `<div class="setup-card" style="margin-top:12px;flex-direction:row;align-items:center"><span style="flex:1">${icon("refresh")} ${t("reloadHint")}</span><button class="btn primary" id="reloadBtn">${t("reload")}</button></div>`;
+  head += `<div class="set-tabs" role="tablist">${SETTINGS_TABS.map(([id, ic, key]) => `<button role="tab" data-stab="${id}" class="${id === tab ? "on" : ""}" aria-selected="${id === tab}">${icon(ic)}${t(key)}</button>`).join("")}</div>`;
+  $("#settingsPage").innerHTML = head + `<div class="set-body">${html}</div>`;
+  if (tab === "about") loadLogs();
+  if (tab === "tools") invoke("mcp_status").then((m) => { S.mcp = m; renderMcpList(); }).catch(() => {});
 }
+/** Settings tabs: [id, icon, i18n key]. */
+const SETTINGS_TABS = [["general", "gear", "setGeneral"], ["engine", "chip", "engine"], ["chat", "sparkle", "chatSection"], ["tools", "globe", "setTools"], ["keys", "bolt", "setKeys"], ["about", "list", "about"]];
 /** JSON text indented for reading (left as it is when it doesn't parse). */
 function prettyJson(text) {
   try { return text ? JSON.stringify(JSON.parse(text), null, 2) : ""; } catch { return text; }
@@ -1300,6 +1315,8 @@ $("#settingsPage").addEventListener("input", (e) => {
   if (e.target.dataset.k === "compress_at") $("#compV").textContent = Math.round(e.target.value * 100) + "%";
 });
 $("#settingsPage").addEventListener("click", async (e) => {
+  const st = e.target.closest("[data-stab]");
+  if (st) { S.settingsTab = st.dataset.stab; renderSettings(); $("#view-settings .page").scrollTop = 0; return; }
   const id = e.target.closest("button")?.id;
   if (id === "reloadBtn") loadModel(S.info.model);
   if (id === "updRt") { toast(t("downloading") + " llama.cpp…"); S.runtime = await call("update_runtime"); renderSettings(); toast("llama.cpp " + S.runtime); }

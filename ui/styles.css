@@ -337,6 +337,17 @@ a.chip:hover { border-color: var(--accent); color: var(--text); }
 .page h2 { font-size: 21px; margin: 0 0 4px; }
 .page h3 { font-size: 14px; margin: 26px 0 10px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .page .lead { color: var(--text-3); margin: 0 0 8px; }
+/* settings: one tab at a time; the bar stays put while the page scrolls */
+.set-tabs { position: sticky; top: 0; z-index: 2; display: flex; gap: 2px; margin: 14px 0 0; padding-top: 4px; background: var(--bg); border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
+.set-tabs button { display: flex; align-items: center; gap: 7px; padding: 9px 14px; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; background: transparent; color: var(--text-2); font-weight: 500; white-space: nowrap; border-radius: 6px 6px 0 0; }
+.set-tabs button:hover { color: var(--text); background: var(--panel); }
+.set-tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+.set-body > h3:first-child { margin-top: 18px; }
+.set-body > .field:first-child, .set-body > .about:first-child, .set-body > .shortcuts:first-child { margin-top: 6px; }
+.set-body > .shortcuts:first-child { padding-top: 12px; }
+.set-body .field { padding: 11px 0; }
+.set-body .logs { max-height: 260px; }
+#settingsPage { padding-bottom: 24px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
 .card { border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); padding: 15px 16px; display: flex; flex-direction: column; gap: 9px; position: relative; transition: border-color 0.15s; }
 .card:hover { border-color: var(--line-2); }
