@@ -41,4 +41,4 @@ Write-Host "Pushing main ($((& $git rev-parse --short HEAD).Trim())) - the Relea
 & $git push origin main
 if ($LASTEXITCODE -ne 0) { throw "git push failed - push main from GitHub Desktop instead; the workflow does the rest" }
 Write-Host "`nPushed. The Release workflow is now building ${tag}:" -ForegroundColor Green
-Write-Host "  https://github.com/Akulav/local-ai-ui/actions"
+Write-Host "  https://github.com/Akulav/lumen/actions"

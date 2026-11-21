@@ -68,7 +68,7 @@ async fn stream_inner(
     if body.get("model").is_none() {
         body["model"] = json!("local");
     }
-    let resp = state.http.post(format!("{base}/v1/chat/completions")).json(&body).send().await?;
+    let resp = state.local.post(format!("{base}/v1/chat/completions")).json(&body).send().await?;
     if !resp.status().is_success() {
         let code = resp.status();
         let text = resp.text().await.unwrap_or_default();

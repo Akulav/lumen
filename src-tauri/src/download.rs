@@ -1,23 +1,27 @@
-//! Resumable HTTP downloads used for models, the embedding model and the llama.cpp runtime.
+//! Resumable HTTP downloads used for models, the embedding model, the llama.cpp runtime and updates.
+//! A download with a known SHA-256 is checked before it is moved into place.
 
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
 /// Resumable download to `dest` (via `dest.part`). Emits `download-progress` events tagged with `id`.
+/// With `sha256` (lowercase hex) the finished file must match it, or it is deleted and nothing is kept.
 pub async fn download(
     app: &AppHandle,
-    http: &reqwest::Client,
     id: &str,
     label: &str,
     url: &str,
     dest: &Path,
+    sha256: Option<&str>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     let part = dest.with_extension(format!(
@@ -29,6 +33,7 @@ pub async fn download(
     }
     let mut have = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
 
+    let http = app.state::<Arc<crate::state::AppState>>().http.clone();
     let mut req = http.get(url);
     if have > 0 {
         req = req.header("Range", format!("bytes={have}-"));
@@ -37,6 +42,7 @@ pub async fn download(
     let status = resp.status();
     if status.as_u16() == 416 {
         // already complete
+        verify(&part, sha256).await?;
         tokio::fs::rename(&part, dest).await?;
         return Ok(());
     }
@@ -91,7 +97,78 @@ pub async fn download(
     if total > 0 && done < total {
         return Err(anyhow!("download interrupted ({done}/{total} bytes) - try again to resume"));
     }
+    verify(&part, sha256).await?;
     tokio::fs::rename(&part, dest).await?;
     let _ = app.emit("download-progress", json!({"id": id, "label": label, "done": done, "total": total, "finished": true}));
     Ok(())
+}
+
+/// Checks a finished download against its published SHA-256; a mismatch deletes it (a resumed download
+/// with a broken start would otherwise fail the same way forever).
+async fn verify(file: &Path, sha256: Option<&str>) -> Result<()> {
+    let Some(expected) = sha256 else { return Ok(()) };
+    let f = file.to_path_buf();
+    let actual = tokio::task::spawn_blocking(move || sha256_file(&f)).await??;
+    if !actual.eq_ignore_ascii_case(expected.trim()) {
+        let _ = tokio::fs::remove_file(file).await;
+        return Err(anyhow!("the download is damaged or not the published file (SHA-256 mismatch) - try again"));
+    }
+    Ok(())
+}
+
+/// SHA-256 of a file as lowercase hex.
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A 64-digit hex SHA-256 from `text` (`"sha256:<hex>"` as GitHub gives it, or the bare hex).
+pub fn parse_sha256(text: &str) -> Option<String> {
+    let hex = text.trim().strip_prefix("sha256:").unwrap_or(text.trim());
+    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then(|| hex.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_matches_known_value() {
+        let p = std::env::temp_dir().join(format!("lumen-sha-{}", crate::state::new_id()));
+        std::fs::write(&p, b"abc").unwrap();
+        let h = sha256_file(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(h, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn digests_parse_from_github_and_hugging_face() {
+        let hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(parse_sha256(&format!("sha256:{hex}")).as_deref(), Some(hex));
+        assert_eq!(parse_sha256(&hex.to_uppercase()).as_deref(), Some(hex));
+        assert_eq!(parse_sha256("sha1:abc"), None);
+        assert_eq!(parse_sha256(""), None);
+    }
+
+    #[test]
+    fn a_damaged_download_is_rejected_and_removed() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let p = std::env::temp_dir().join(format!("lumen-verify-{}", crate::state::new_id()));
+        std::fs::write(&p, b"abc").unwrap();
+        rt.block_on(async {
+            assert!(verify(&p, Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")).await.is_ok());
+            assert!(verify(&p, None).await.is_ok());
+            assert!(verify(&p, Some(&"0".repeat(64))).await.is_err());
+        });
+        assert!(!p.exists(), "a mismatching file is deleted");
+    }
 }

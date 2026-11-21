@@ -41,7 +41,7 @@ pub fn parse_prometheus(text: &str) -> Map<String, Value> {
 
 /// Fetches the server counters; quick timeout so a busy server never stalls the sampler.
 fn engine_counters(state: &AppState, port: u16) -> Option<Map<String, Value>> {
-    let http = state.http.clone();
+    let http = state.local.clone();
     let text = tauri::async_runtime::block_on(async move {
         http.get(format!("http://127.0.0.1:{port}/metrics")).timeout(Duration::from_millis(800)).send().await.ok()?.text().await.ok()
     })?;

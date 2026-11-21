@@ -12,6 +12,7 @@ mod db;
 mod download;
 mod extract;
 mod llm;
+mod mcp;
 mod metrics;
 mod models;
 mod prompts;
@@ -119,6 +120,7 @@ pub async fn shutdown(app: &AppHandle) {
     let state = app.state::<Arc<AppState>>();
     state.quitting.store(true, Ordering::Relaxed);
     chat::stop_all(&state);
+    state.mcp.reset();
     server::stop_all(app).await;
 }
 
@@ -183,6 +185,8 @@ fn main() {
             commands::open_url,
             commands::open_path,
             commands::quit_app,
+            commands::mcp_status,
+            commands::mcp_reconnect,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

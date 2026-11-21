@@ -7,6 +7,36 @@ pushed to `main`, GitHub Actions tags, builds and publishes the release.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-21
+
+### Added
+- **MCP servers**: Settings → MCP servers takes the usual `mcpServers` JSON. Local servers (`command` + `args`, over
+  stdio) and remote ones (`url` + `headers`, Streamable HTTP) start with the first chat that needs tools; their tools
+  reach the model as `mcp__<server>__<tool>`. Every call is confirmed in the chat (Run / Always in this chat / Deny)
+  unless the server has `"trust": true`. Settings shows each server's state and tools, with Reconnect.
+
+### Security
+- The llama.cpp engine is installed only when it matches the SHA-256 GitHub publishes for the download; models and
+  the embedding model are checked against Hugging Face's SHA-256. A damaged download is deleted.
+- The local llama-servers require a random key per run, so web pages and other programs can't use the model through
+  its port.
+- Dependency updates for security advisories: `zip` 9 (symlink escapes when unpacking), `rusqlite` 0.43 (bundled
+  SQLite fix), `pdf-extract` 0.12 (stack overflow on nested PDFs).
+
+### Changed
+- Windows 11 look: dark-mode colours (#202020 / #2b2b2b layers, subtle borders), the Windows accent, 4 px controls and
+  8 px cards, Segoe UI Variable; no gradients or glows.
+- Links point to the renamed repository `Akulav/lumen`.
+
+### Fixed
+- The Windows setup could not close a running Lumen in a folder whose name contains an apostrophe.
+
+### Removed
+- Moving data and apps from layouts before 0.15: the macOS `~/Library/Application Support/Lumen` data and old
+  `/Applications/Lumen.app` / `~/Applications/Lumen.app`, the webview data in `com.akulav.lumen`, and the setup's
+  takeover of the old NSIS install (Lumen 0.8 and earlier). Those versions need a fresh install (Windows: uninstall
+  the old Lumen first; your `LumenData` stays).
+
 ## [0.15.1] - 2026-11-12
 
 ### Fixed

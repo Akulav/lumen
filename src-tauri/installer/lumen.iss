@@ -12,8 +12,7 @@
 ; Before installing, an existing install is uninstalled silently (the program, shortcuts and Apps entry -
 ; LumenData with the models, chats and settings stays; only an uninstall where you answer "yes" deletes
 ; it), then the new version is installed and, with /LAUNCH=1, started. Run by hand over an install it
-; does the same with its usual pages. Installs made by the old NSIS setup (Lumen 0.8 and earlier, same
-; folder) are taken over the same way. The pictures come from scripts\installer-images.ps1.
+; does the same with its usual pages. The pictures come from scripts\installer-images.ps1.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -21,17 +20,14 @@
 #ifndef Exe
   #define Exe "..\target\release\lumen.exe"
 #endif
-; (tests compile a separate copy - /DName=LumenTest /DGuid=… /DNsisKeyName=… - so a test install never
-; touches a real one: its shortcuts, Apps entry and the NSIS entry it takes over)
+; (tests compile a separate copy - /DName=LumenTest /DGuid=… - so a test install never touches a real one:
+; its shortcuts and Apps entry)
 #ifndef Name
   #define Name "Lumen"
 #endif
 #ifndef Guid
   ; never change it: it is how an update or the uninstaller finds this install
   #define Guid "9627B1F1-110C-4E82-9331-519A0C00C734"
-#endif
-#ifndef NsisKeyName
-  #define NsisKeyName "Lumen"
 #endif
 ; (Windows file versions are numbers only: 1.0.0-beta.1 -> 1.0.0)
 #define NumVersion Copy(AppVersion, 1, Pos("-", AppVersion + "-") - 1)
@@ -43,15 +39,15 @@ AppVersion={#AppVersion}
 AppVerName=Lumen {#AppVersion}
 AppPublisher=Akulav
 AppCopyright=Made by Akulav
-AppPublisherURL=https://github.com/Akulav/local-ai-ui
-AppSupportURL=https://github.com/Akulav/local-ai-ui/issues
-AppUpdatesURL=https://github.com/Akulav/local-ai-ui/releases
+AppPublisherURL=https://github.com/Akulav/lumen
+AppSupportURL=https://github.com/Akulav/lumen/issues
+AppUpdatesURL=https://github.com/Akulav/lumen/releases
 VersionInfoCompany=Akulav
 VersionInfoCopyright=Made by Akulav
 VersionInfoProductName=Lumen
 VersionInfoDescription=Lumen Setup
 VersionInfoVersion={#NumVersion}
-DefaultDirName={code:DefaultDir}
+DefaultDirName={localappdata}\Lumen
 ; (Inno Setup hides the Welcome and folder pages unless told: this setup shows both)
 DisableWelcomePage=no
 DisableDirPage=no
@@ -104,31 +100,17 @@ Filename: "{app}\lumen.exe"; Description: "{cm:LaunchProgram,Lumen}"; Flags: now
 Filename: "{app}\lumen.exe"; Parameters: "--after-update"; WorkingDir: "{app}"; Flags: nowait; Check: LaunchAfterUpdate
 
 [UninstallDelete]
-; (what an update leaves beside the program until Lumen's next start removes it)
-Type: files; Name: "{app}\lumen.exe.old"
+; (the downloaded setup an update leaves until Lumen's next start removes it)
 Type: filesandordirs; Name: "{app}\LumenData\updates"
 
 [Code]
-const
-  NsisKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#NsisKeyName}';
-
-// Where Lumen goes: the folder of an install made by the old NSIS setup (so its LumenData is found),
-// else %LOCALAPPDATA%\Lumen. (An install made by this setup is found through UsePreviousAppDir.)
-function DefaultDir(Param: String): String;
-var
-  Dir: String;
-begin
-  if RegQueryStringValue(HKCU, NsisKey, 'InstallLocation', Dir) and (RemoveQuotes(Dir) <> '') then
-    Result := RemoveQuotes(Dir)
-  else
-    Result := ExpandConstant('{localappdata}\Lumen');
-end;
-
 // A running Lumen from this folder is ended first (its job object takes llama-server with it).
 procedure StopRunning(Dir: String);
 var
   Code: Integer;
 begin
+  // (a ' in the folder name is doubled for PowerShell's single-quoted string)
+  StringChangeEx(Dir, '''', '''''', True);
   Exec('powershell.exe',
        '-NoProfile -NonInteractive -Command "Get-Process lumen -ErrorAction SilentlyContinue | ' +
        'Where-Object { $_.Path -eq ''' + Dir + '\lumen.exe'' } | Stop-Process -Force"',
@@ -146,7 +128,7 @@ end;
 // its Apps entry go; LumenData stays (the uninstallers delete it only when asked, never when silent).
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  Uninst, Dir: String;
+  Uninst: String;
   Code: Integer;
 begin
   Result := '';
@@ -162,22 +144,6 @@ begin
       if not Exec(Uninst, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, Code) then
         Log('The old uninstaller did not start; installing over it');
     end;
-  end;
-  // Lumen 0.8 and earlier (NSIS). "_?=<folder>" makes the NSIS uninstaller run in place and wait -
-  // without it, it copies itself away, returns at once and could delete the new lumen.exe later.
-  if RegQueryStringValue(HKCU, NsisKey, 'UninstallString', Uninst) then
-  begin
-    Uninst := RemoveQuotes(Uninst);
-    Dir := ExtractFileDir(Uninst);
-    if FileExists(Uninst) then
-    begin
-      Log('Removing the NSIS install of Lumen first (LumenData stays): ' + Uninst);
-      if Exec(Uninst, '/S _?=' + Dir, '', SW_HIDE, ewWaitUntilTerminated, Code) then
-        DeleteFile(Uninst)
-      else
-        Log('The NSIS uninstaller did not start; installing over it');
-    end;
-    RegDeleteKeyIncludingSubkeys(HKCU, NsisKey);
   end;
 end;
 

@@ -16,8 +16,7 @@ use crate::platform::Job;
 
 /// Where everything lives: `LumenData` in the folder Lumen is installed in – next to the program
 /// (Windows, Linux, a portable copy) or, on macOS, next to `Lumen.app` (never inside the bundle). Only
-/// when that folder can't be written to (or for a pre-0.15 `Lumen.app` sitting straight in an
-/// Applications folder) the user's app-data folder is used.
+/// when that folder can't be written to is the user's app-data folder used.
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub root: PathBuf,
@@ -38,35 +37,13 @@ impl Paths {
             Some(p) => p.to_path_buf(),
             None => exe_dir.clone(),
         };
-        let legacy_bundle = bundle.is_some() && folder.file_name().is_some_and(|n| n == "Applications");
         let beside = folder.join("LumenData");
-        let root = if legacy_bundle {
-            user_data_dir().unwrap_or(beside)
-        } else if std::fs::create_dir_all(&beside).is_ok() && writable(&beside) {
-            // macOS before 0.15 kept the data in ~/Library/Application Support/Lumen: it moves along
-            if bundle.is_some() && !beside.join("data").exists() {
-                if let Some(old) = user_data_dir().filter(|d| d.join("data").is_dir()) {
-                    let _ = move_dir_contents(&old, &beside);
-                }
-            }
+        let root = if std::fs::create_dir_all(&beside).is_ok() && writable(&beside) {
             beside
         } else {
             user_data_dir().unwrap_or(beside)
         };
         let _ = std::fs::create_dir_all(&root);
-        // The webview's own data, kept by Tauri in <local app data>/com.akulav.lumen before 0.15.
-        let web = root.join("webview");
-        if !web.exists() {
-            let local = if cfg!(windows) {
-                std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-            } else {
-                user_data_dir().and_then(|d| d.parent().map(Path::to_path_buf))
-            };
-            if let Some(old) = local.map(|l| l.join("com.akulav.lumen")).filter(|o| o.is_dir()) {
-                let _ = move_dir_contents(&old, &web);
-                let _ = std::fs::remove_dir(&old);
-            }
-        }
         let p = Paths {
             runtime: root.join("runtime"),
             models: root.join("models"),
@@ -94,40 +71,6 @@ pub fn user_data_dir() -> Option<PathBuf> {
     }
     let data = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(".local").join("share"));
     Some(data.join("lumen"))
-}
-
-/// Move everything in `from` into `to` (rename, or copy + delete across drives); entries already in `to` stay
-/// where they are.
-pub fn move_dir_contents(from: &Path, to: &Path) -> std::io::Result<()> {
-    fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
-        if src.is_dir() {
-            std::fs::create_dir_all(dst)?;
-            for e in std::fs::read_dir(src)? {
-                let e = e?;
-                copy_tree(&e.path(), &dst.join(e.file_name()))?;
-            }
-            Ok(())
-        } else {
-            std::fs::copy(src, dst).map(|_| ())
-        }
-    }
-    std::fs::create_dir_all(to)?;
-    for e in std::fs::read_dir(from)? {
-        let e = e?;
-        let (src, dst) = (e.path(), to.join(e.file_name()));
-        if dst.exists() {
-            continue;
-        }
-        if std::fs::rename(&src, &dst).is_err() {
-            if let Err(err) = copy_tree(&src, &dst) {
-                let _ = if dst.is_dir() { std::fs::remove_dir_all(&dst) } else { std::fs::remove_file(&dst) };
-                return Err(err);
-            }
-            let _ = if src.is_dir() { std::fs::remove_dir_all(&src) } else { std::fs::remove_file(&src) };
-        }
-    }
-    let _ = std::fs::remove_dir(from);
-    Ok(())
 }
 
 fn writable(dir: &Path) -> bool {
@@ -173,6 +116,8 @@ pub struct Settings {
     pub searxng_url: String,
     /// Always-on guidance from the user, appended to every chat's system prompt.
     pub custom_instructions: String,
+    /// MCP servers whose tools the model may use, as `{"mcpServers": {...}}` JSON (mcp.rs). Empty = none.
+    pub mcp_config: String,
 }
 
 impl Default for Settings {
@@ -199,6 +144,7 @@ impl Default for Settings {
             search_key: String::new(),
             searxng_url: String::new(),
             custom_instructions: String::new(),
+            mcp_config: String::new(),
         }
     }
 }
@@ -253,6 +199,11 @@ pub struct AppState {
     pub indexes: Mutex<HashMap<String, Arc<ProjectIndex>>>,
     pub indexing: Mutex<HashMap<String, Arc<AtomicBool>>>,
     pub http: reqwest::Client,
+    /// For Lumen's own llama-servers: sends `api_key` (they refuse requests without it, so a web page or
+    /// another program can't use the model through the local port).
+    pub local: reqwest::Client,
+    /// Random per run, given to every llama-server with `--api-key`.
+    pub api_key: String,
     pub job: Job,
     pub logs: Arc<Mutex<Vec<String>>>,
     /// tokens/s of the generation in flight (for the live status bar)
@@ -267,6 +218,8 @@ pub struct AppState {
     pub approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     /// Per chat, the process scopes ("git", "run") the user allowed for the rest of the session.
     pub allowed_tools: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Connected MCP servers and their tools.
+    pub mcp: crate::mcp::Mcp,
 }
 
 impl AppState {
@@ -279,6 +232,10 @@ impl AppState {
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36")
             .connect_timeout(std::time::Duration::from_secs(20))
             .build()?;
+        let api_key = format!("{}{}", new_id(), new_id());
+        let mut auth = reqwest::header::HeaderMap::new();
+        auth.insert(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}").parse()?);
+        let local = reqwest::Client::builder().default_headers(auth).no_proxy().connect_timeout(std::time::Duration::from_secs(20)).build()?;
         Ok(AppState {
             paths,
             db,
@@ -293,6 +250,8 @@ impl AppState {
             indexes: Mutex::new(HashMap::new()),
             indexing: Mutex::new(HashMap::new()),
             http,
+            local,
+            api_key,
             job: Job::new(),
             logs: Arc::new(Mutex::new(Vec::new())),
             live_tps: RwLock::new(0.0),
@@ -302,6 +261,7 @@ impl AppState {
             no_tray: AtomicBool::new(false),
             approvals: Mutex::new(HashMap::new()),
             allowed_tools: Mutex::new(HashMap::new()),
+            mcp: Default::default(),
         })
     }
 

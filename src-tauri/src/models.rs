@@ -189,12 +189,35 @@ pub async fn download_model(app: &AppHandle, repo: &str, path: &str) -> Result<S
         path.split('/').map(|s| urlencoding::encode(s).into_owned()).collect::<Vec<_>>().join("/")
     );
     let dest = state.paths.models.join(&name);
-    let r = crate::download::download(app, &state.http, &id, &name, &url, &dest, cancel).await;
+    let sha = hf_sha256(&state.http, repo, path).await;
+    if sha.is_none() {
+        state.log(format!("[models] no SHA-256 from Hugging Face for {repo}/{path}: the download is not checked"));
+    }
+    let r = crate::download::download(app, &id, &name, &url, &dest, sha.as_deref(), cancel).await;
     state.downloads.lock().remove(&id);
     if let Err(e) = &r {
         let _ = app.emit("download-progress", json!({"id": id, "label": name, "error": e.to_string()}));
     }
     r.map(|_| name)
+}
+
+/// The SHA-256 Hugging Face publishes for a file stored with Git LFS (every GGUF is): from the repo tree
+/// of the file's folder. None when the lookup fails (the download then goes unchecked, as before).
+pub async fn hf_sha256(http: &reqwest::Client, repo: &str, path: &str) -> Option<String> {
+    let dir = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let enc = |s: &str| s.split('/').filter(|p| !p.is_empty()).map(|p| urlencoding::encode(p).into_owned()).collect::<Vec<_>>().join("/");
+    let url = if dir.is_empty() {
+        format!("https://huggingface.co/api/models/{repo}/tree/main")
+    } else {
+        format!("https://huggingface.co/api/models/{repo}/tree/main/{}", enc(dir))
+    };
+    let tree: Value = http.get(url).timeout(std::time::Duration::from_secs(30)).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    lfs_sha256(&tree, path)
+}
+
+fn lfs_sha256(tree: &Value, path: &str) -> Option<String> {
+    let entry = tree.as_array()?.iter().find(|f| f["path"].as_str() == Some(path))?;
+    crate::download::parse_sha256(entry["lfs"]["oid"].as_str()?)
 }
 
 pub fn cancel_download(state: &AppState, id: &str) {
@@ -251,4 +274,22 @@ pub async fn search_hf(state: &AppState, query: &str) -> Result<Value> {
         .map(|m| json!({"id": m["id"], "downloads": m["downloads"], "likes": m["likes"]}))
         .collect();
     Ok(json!(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shape of Hugging Face's tree API: the LFS oid is the file's SHA-256.
+    #[test]
+    fn lfs_hash_comes_from_the_repo_tree() {
+        let oid = "ab".repeat(32);
+        let tree = json!([
+            {"type": "file", "path": "README.md", "size": 10},
+            {"type": "file", "path": "Q4/model-Q4.gguf", "size": 5, "lfs": {"oid": oid, "size": 5}}
+        ]);
+        assert_eq!(lfs_sha256(&tree, "Q4/model-Q4.gguf"), Some(oid));
+        assert_eq!(lfs_sha256(&tree, "README.md"), None);
+        assert_eq!(lfs_sha256(&tree, "missing.gguf"), None);
+    }
 }

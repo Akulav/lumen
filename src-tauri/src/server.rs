@@ -299,6 +299,8 @@ pub async fn start_llm(app: &AppHandle, model_file: &str) -> Result<()> {
         "127.0.0.1".into(),
         "--port".into(),
         port.to_string(),
+        "--api-key".into(),
+        state.api_key.clone(),
         "--jinja".into(),
         "--reasoning-format".into(),
         "deepseek".into(),
@@ -341,7 +343,7 @@ pub async fn start_llm(app: &AppHandle, model_file: &str) -> Result<()> {
     args.push("--cache-ram".into());
     args.push(cache.to_string());
 
-    state.log(format!("[lumen] starting llama-server {}", args.join(" ")));
+    state.log(format!("[lumen] starting llama-server {}", args.join(" ").replace(&state.api_key, "***")));
     set_status(app, |i| {
         i.state = "starting".into();
         i.message = "Loading model into memory…".into();
@@ -351,7 +353,7 @@ pub async fn start_llm(app: &AppHandle, model_file: &str) -> Result<()> {
     spawn_logger(&mut child, state.logs.clone(), "llm", Some(app.clone()));
     set_status(app, |i| i.pid = pid);
 
-    if let Err(e) = wait_healthy(&state.http, port, &mut child, &state.logs).await {
+    if let Err(e) = wait_healthy(&state.local, port, &mut child, &state.logs).await {
         let _ = child.start_kill();
         set_status(app, |i| {
             i.state = "error".into();
@@ -361,7 +363,7 @@ pub async fn start_llm(app: &AppHandle, model_file: &str) -> Result<()> {
         return Err(e);
     }
 
-    let n_ctx = read_n_ctx(&state.http, port).await.unwrap_or(4096);
+    let n_ctx = read_n_ctx(&state.local, port).await.unwrap_or(4096);
     *state.llm.lock().await = Some(ServerProc { child, port, pid });
     {
         let mut s = state.settings.write();
@@ -412,7 +414,8 @@ pub async fn ensure_embed(app: &AppHandle) -> Result<u16> {
     if !model.exists() {
         let url = format!("https://huggingface.co/{EMBED_REPO}/resolve/main/{EMBED_FILE}?download=true");
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        crate::download::download(app, &state.http, "embed-model", "Embedding model (Qwen3-Embedding 0.6B)", &url, &model, cancel).await?;
+        let sha = crate::models::hf_sha256(&state.http, EMBED_REPO, EMBED_FILE).await;
+        crate::download::download(app, "embed-model", "Embedding model (Qwen3-Embedding 0.6B)", &url, &model, sha.as_deref(), cancel).await?;
     }
     let backend = state.settings.read().backend.clone();
     let exe = crate::runtime::ensure(app, &backend, false).await?;
@@ -424,14 +427,14 @@ pub async fn ensure_embed(app: &AppHandle) -> Result<u16> {
         "--embedding", "--pooling", "last",
         "--ctx-size", "16384", "--parallel", "8", "--batch-size", "2048", "--ubatch-size", "2048",
         "--device", "none", "--gpu-layers", "0", "--fit", "off",
-        "--threads", &threads.to_string(), "--no-webui",
+        "--threads", &threads.to_string(), "--no-webui", "--api-key", &state.api_key,
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     let (mut child, pid) = spawn_server(&state, &exe, &args)?;
     spawn_logger(&mut child, state.logs.clone(), "embed", None);
-    wait_healthy(&state.http, port, &mut child, &state.logs).await?;
+    wait_healthy(&state.local, port, &mut child, &state.logs).await?;
     *guard = Some(ServerProc { child, port, pid });
     Ok(port)
 }
@@ -441,7 +444,7 @@ pub async fn embed(app: &AppHandle, inputs: &[String]) -> Result<Vec<Vec<f32>>> 
     let state = app.state::<Arc<AppState>>();
     let body = json!({ "input": inputs, "model": "embed" });
     let v: Value = state
-        .http
+        .local
         .post(format!("http://127.0.0.1:{port}/v1/embeddings"))
         .json(&body)
         .timeout(Duration::from_secs(600))

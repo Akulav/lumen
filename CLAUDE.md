@@ -55,10 +55,9 @@ The owner wants every change to ship as a release. For **every** change set (fea
 ## Install & update
 - **Windows**: `src-tauri/installer/lumen.iss` (Inno Setup 6, per user, EN + RO via `Romanian.isl` which overrides
   only the visible texts on top of `Default.isl`; wizard pictures from `scripts\installer-images.ps1`). Default folder
-  `%LOCALAPPDATA%\Lumen`; `PrepareToInstall` silently uninstalls the previous version and takes over an old NSIS
-  install (Lumen ≤ 0.8, registry `HKCU\…\Uninstall\Lumen`) with `uninstall.exe /S _?=<dir>` – `_?=` makes NSIS run in
-  place and wait. Uninstall asks before deleting `LumenData` (never when silent). Never change the AppId GUID.
-  `.iss`/`.isl` are UTF-8 **with BOM** (Inno needs it for ă/ș/ț). Test builds use `/DName=… /DGuid=… /DNsisKeyName=…`
+  `%LOCALAPPDATA%\Lumen`; `PrepareToInstall` silently uninstalls the previous version (the old NSIS setup of
+  Lumen ≤ 0.8 is no longer taken over since 0.16). Uninstall asks before deleting `LumenData` (never when silent). Never change the AppId GUID.
+  `.iss`/`.isl` are UTF-8 **with BOM** (Inno needs it for ă/ș/ț). Test builds use `/DName=… /DGuid=…`
   so a test install never touches the real one; the uninstaller may be `unins001.exe` after an update – read
   `UninstallString` from the registry.
 - **Linux** (`install.rs`): the downloaded program asks for an install folder (zenity/kdialog; `--install-dir`;
@@ -66,12 +65,11 @@ The owner wants every change to ship as a release. For **every** change set (fea
   `lumen.desktop` (app menu + Desktop) and starts that copy; `--here`, `--uninstall [--delete-data]`, `--version`.
 - **macOS** (`install.rs`): the downloaded program, started outside a bundle, asks for a folder (Finder; default
   `~/Applications/Lumen`) and builds `<folder>/Lumen.app` around a copy of itself (`src-tauri/installer/Info.plist` compiled in, icon.icns, quarantine removed, ad-hoc
-  `codesign`) and `open`s it; a pre-0.15 `~/Applications/Lumen.app` / `/Applications/Lumen.app` moves into the new
-  layout with its data. `--here`, `--uninstall [--delete-data]`.
+  `codesign`) and `open`s it. `--here`, `--uninstall [--delete-data]`.
 - **Everything lives in the install folder** (owner's rule, like akulav-mc-launcher): `Paths::resolve` → `LumenData`
   next to the program (macOS: next to Lumen.app, never inside it), including the webview's data (`LumenData/webview`,
   set on the window in `main.rs`; macOS WKWebView can't be moved). The OS app-data folder only when that folder isn't
-  writable or for a pre-0.15 bundle straight in an Applications folder.
+  writable. (Migrations from layouts before 0.15 were removed in 0.16.)
 - Linux/macOS: `--after-update` (the updater's relaunch) runs in place like `--here`.
 - **Updater** (`updater.rs`): checks 20 s after start + every 6 h (setting `check_updates`) and on demand; also offers
   newer llama.cpp builds. Install = download → SHA-256 against the release's `SHA256SUMS.txt` → Windows: start the setup
@@ -100,7 +98,7 @@ The owner wants every change to ship as a release. For **every** change set (fea
 - `cmd /c` does not inherit PowerShell's `Set-Location`: `cd /d` inside the cmd string.
 - PS 5.1: `[regex]::Replace(s, p, r, 1)` treats `1` as RegexOptions; use `([regex]'p').Replace(s, r, 1)`.
 - A running `dist\Lumen\Lumen.exe` locks the exe; `run.bat` closes it. Killing it also kills llama-server.
-- The user's real install is NSIS 0.8 at `%LOCALAPPDATA%\Lumen`: never run setups/uninstallers against it in tests.
+- The user's real install is at `%LOCALAPPDATA%\Lumen`: never run setups/uninstallers against it in tests.
 - Model downloads are 5–20 GB. For tests use a small GGUF (e.g. `dist\Lumen\LumenData\models\embedding\Qwen3-Embedding-0.6B`).
 - Computer use: the native folder picker only accepts clicks.
 
@@ -121,6 +119,7 @@ src-tauri/src/
   runtime.rs    downloads the llama.cpp build for this OS/backend from GitHub; GPU detection
   models.rs     curated catalog for 16 GB cards, local list/delete, HF download/search
   download.rs   resumable downloader with progress events
+  mcp.rs        MCP client: mcpServers JSON (settings.mcp_config), stdio + Streamable HTTP, tools as mcp__<server>__<tool>
   llm.rs        SSE streaming client for /v1/chat/completions; readable server errors (bad allocation)
   chat.rs       prompt assembly, tool loop, title, context budget, compression, export
   tools.rs      model tools: project files (sandboxed, backups for undo), web tools
@@ -139,7 +138,7 @@ src-tauri/src/
 
 ## Backend → UI events
 `server-status`, `metrics`, `download-progress`, `index-progress`, `update-status` (UpdateInfo),
-`update-prompt` (tray asked to update/check; the window confirms), `chat-event`
+`update-prompt` (tray asked to update/check; the window confirms), `mcp-status` (MCP servers' state), `chat-event`
 (`chat-event.kind`: busy, message, message_update, assistant_start, delta, progress, tool_pending,
 tool_start, tool_confirm / tool_confirmed (a process tool waits for the user; answered with `confirm_tool`),
 tool_progress (audit_code batches), assistant_done, assistant_failed, compress_progress, compressed, ctx, title, error).
@@ -154,6 +153,10 @@ tool_progress (audit_code batches), assistant_done, assistant_failed, compress_p
 - Prompt-cache friendliness: keep the system prompt and old messages byte-stable; per-message RAG context is stored in
   `meta.prompt_content` and re-sent identically.
 - Tool file access goes through `tools::resolve` (keeps paths inside the project folder) and `backup()` before writing.
+- llama-servers require `state.api_key` (`--api-key`): talk to them with `state.local` (sends the key), never `state.http`.
+- Downloads: pass the expected SHA-256 to `download::download` (GitHub `digest` for llama.cpp, HF LFS oid for models).
+- MCP tool calls are confirmed like `run_command` (scope `mcp:<server>`) unless the server has `trust: true`; their
+  results don't count as user-given links.
 - Web search uses official APIs only – no HTML scraping of search engines, no bot-check tricks. Wikipedia and
   DuckDuckGo get the honest `Lumen/<version>` User-Agent. Default provider: DuckDuckGo's keyless Instant Answer API
   topped up with Wikipedia (no full-web results; `html.duckduckgo.com` is off limits).

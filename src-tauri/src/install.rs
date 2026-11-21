@@ -9,8 +9,7 @@
 //! - Linux: `<folder>/lumen` (default ~/.local/share/lumen) + an app-menu entry (and a desktop shortcut
 //!   when there is a desktop folder).
 //! - macOS: `<folder>/Lumen.app` (default ~/Applications/Lumen; Info.plist from src-tauri/installer, the
-//!   icon, an ad-hoc signature). An older `~/Applications/Lumen.app` or `/Applications/Lumen.app` and its
-//!   data in ~/Library/Application Support/Lumen move into the folder.
+//!   icon, an ad-hoc signature).
 //!
 //! The folder is remembered (`<config dir>/lumen/install-dir`), so a newer download updates that copy
 //! without asking. `--here` runs where it is instead, `--uninstall` removes the program and its entries
@@ -41,15 +40,9 @@ pub fn first_run() -> bool {
         let _ = menu_entries(&program_in(&folder));
         return true;
     }
-    #[cfg(target_os = "macos")]
-    let legacy_app = mac::legacy_app_of(&exe);
-    #[cfg(not(target_os = "macos"))]
-    let legacy_app: Option<PathBuf> = None;
     let explicit = args.iter().position(|a| a == "--install-dir").and_then(|i| args.get(i + 1)).map(|d| expand_home(d));
     let folder = match explicit.or_else(remembered_folder) {
         Some(f) => f,
-        // a pre-0.15 app updated itself in place: move it without asking
-        None if legacy_app.is_some() => default_folder(),
         None => match ask_folder(&default_folder()) {
             Some(f) => f,
             None => return true, // cancelled: just run it
@@ -57,8 +50,6 @@ pub fn first_run() -> bool {
     };
     match install(&exe, &folder) {
         Ok(()) => {
-            #[cfg(target_os = "macos")]
-            mac::retire_legacy(&folder);
             let skip = args.iter().position(|a| a == "--install-dir");
             let rest: Vec<&String> =
                 args.iter().enumerate().filter(|(i, _)| skip.is_none_or(|s| *i != s && *i != s + 1)).map(|(_, a)| a).collect();
@@ -95,7 +86,7 @@ fn expand_home(text: &str) -> PathBuf {
     }
 }
 
-/// ~/.local/share/lumen (`$XDG_DATA_HOME/lumen`, where Lumen before 0.15 installed) or ~/Applications/Lumen.
+/// ~/.local/share/lumen (`$XDG_DATA_HOME/lumen`) or ~/Applications/Lumen.
 fn default_folder() -> PathBuf {
     if cfg!(target_os = "macos") {
         return home().unwrap_or_default().join("Applications").join("Lumen");
@@ -149,8 +140,7 @@ fn program_in(folder: &Path) -> PathBuf {
     }
 }
 
-/// The install folder `exe` runs from: the remembered one, or (Linux) ~/.local/share/lumen where Lumen
-/// before 0.15 installed. A macOS `Lumen.app` straight in an Applications folder is the old layout: no.
+/// The install folder `exe` runs from: the remembered one, or (Linux) the default ~/.local/share/lumen.
 fn installed_folder_of(exe: &Path) -> Option<PathBuf> {
     let candidates = [remembered_folder(), (!cfg!(target_os = "macos")).then(default_folder)];
     candidates.into_iter().flatten().find(|f| same_file(exe, &program_in(f)))
@@ -307,7 +297,7 @@ fn menu_entries(target: &Path) -> std::io::Result<()> {
 /// Lumen.app, built by the program itself (no disk image).
 #[cfg(target_os = "macos")]
 mod mac {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
 
     /// src-tauri/installer/Info.plist; @VERSION@ becomes this program's version.
@@ -316,39 +306,6 @@ mod mac {
 
     pub fn info_plist() -> String {
         PLIST.replace("@VERSION@", env!("CARGO_PKG_VERSION"))
-    }
-
-    /// Before 0.15: `~/Applications/Lumen.app` or `/Applications/Lumen.app`.
-    fn legacy_apps() -> Vec<PathBuf> {
-        let mut v = vec![PathBuf::from("/Applications/Lumen.app")];
-        if let Some(h) = super::home() {
-            v.push(h.join("Applications").join("Lumen.app"));
-        }
-        v.retain(|a| a.join("Contents").join("MacOS").join("lumen").is_file());
-        v
-    }
-
-    /// The pre-0.15 app this program runs from, if any.
-    pub fn legacy_app_of(exe: &Path) -> Option<PathBuf> {
-        let app = crate::updater::app_bundle(exe)?;
-        legacy_apps().into_iter().find(|a| super::same_file(a, &app))
-    }
-
-    /// After installing into `folder`: the old apps go, and their data
-    /// (~/Library/Application Support/Lumen) moves into `<folder>/LumenData`.
-    pub fn retire_legacy(folder: &Path) {
-        let new_app = folder.join("Lumen.app");
-        for app in legacy_apps() {
-            if !super::same_file(&app, &new_app) {
-                let _ = std::fs::remove_dir_all(&app);
-            }
-        }
-        let data = folder.join("LumenData");
-        if let Some(old) = crate::state::user_data_dir().filter(|d| d.join("data").is_dir()) {
-            if !data.join("data").exists() {
-                let _ = crate::state::move_dir_contents(&old, &data);
-            }
-        }
     }
 
     /// Puts this program in `app` (unless a newer one is there already), with Info.plist and icon, then

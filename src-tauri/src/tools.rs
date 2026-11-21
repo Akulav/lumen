@@ -213,7 +213,9 @@ pub fn extract_links(text: &str) -> Vec<String> {
 fn conversation_links(state: &AppState, chat_id: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for m in state.db.messages(chat_id)? {
-        let from_web = matches!(m.meta["name"].as_str(), Some("fetch_url" | "web_search"));
+        // (web pages and MCP results are outside data: their links never count as given)
+        let name = m.meta["name"].as_str().unwrap_or("");
+        let from_web = matches!(name, "fetch_url" | "web_search") || crate::mcp::is_mcp_tool(name);
         if m.role == "user" || (m.role == "tool" && !from_web) {
             out.extend(extract_links(&m.content));
             // (a clipped or pruned tool result keeps its full text in meta)
@@ -627,6 +629,7 @@ async fn run_inner(ctx: &ToolCtx<'_>, call_id: &str, name: &str, a: &Value) -> R
                 ok: true,
             })
         }
+        other if crate::mcp::is_mcp_tool(other) => crate::mcp::call(ctx, call_id, other, a).await,
         other => Err(anyhow!("unknown tool `{other}`")),
     }
 }
@@ -708,8 +711,8 @@ mod tests {
     fn live_link_fetch() {
         let state = AppState::new().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let given = extract_links("Make it work like https://github.com/Akulav/local-ai-ui please.");
-        for url in ["https://github.com/Akulav/local-ai-ui", "https://raw.githubusercontent.com/Akulav/local-ai-ui/main/.github/workflows/release.yml"] {
+        let given = extract_links("Make it work like https://github.com/Akulav/lumen please.");
+        for url in ["https://github.com/Akulav/lumen", "https://raw.githubusercontent.com/Akulav/lumen/main/.github/workflows/release.yml"] {
             assert!(link_allowed(url, &given), "{url}");
             let page = rt.block_on(crate::web::fetch(&state, url)).unwrap();
             println!("--- {url}: title {:?}, {} chars\n{}\n", page.title, page.text.len(), page.text.chars().take(400).collect::<String>());

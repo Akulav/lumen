@@ -1,4 +1,4 @@
-//! Updates from the GitHub releases (Akulav/local-ai-ui): checked 20 s after start and every 6 hours
+//! Updates from the GitHub releases (Akulav/lumen): checked 20 s after start and every 6 hours
 //! (Settings → About can turn that off), or when asked (the Check for updates button / tray entry).
 //! Also looks for a newer llama.cpp build (runtime.rs installs it).
 //!
@@ -19,8 +19,6 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -30,7 +28,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::state::{now_ms, AppState, LUMEN_UA};
 
 /// GitHub repository the releases come from.
-pub const REPO: &str = "Akulav/local-ai-ui";
+pub const REPO: &str = "Akulav/lumen";
 /// Background check interval (the first check runs shortly after start-up).
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 
@@ -258,18 +256,12 @@ async fn install_inner(app: &AppHandle, state: &AppState, rel: &AppRelease) -> R
     let work = state.paths.root.join("updates");
     std::fs::create_dir_all(&work)?;
     let file = work.join(format!("{}-{}", rel.version, asset_name()));
-    let cancel = Arc::new(AtomicBool::new(false));
-    crate::download::download(app, &state.http, "app-update", &format!("Lumen {}", rel.version), &rel.file, &file, cancel).await?;
-
-    // integrity: the checksum list published with the release must match the download
+    // integrity: the checksum list published with the release must match the download (download.rs
+    // deletes a file that doesn't, and nothing is installed)
     let sums = state.http.get(&rel.sums).header("User-Agent", LUMEN_UA).send().await?.error_for_status()?.text().await?;
     let expected = expected_hash(&sums, asset_name()).ok_or_else(|| anyhow!("{} is not listed in SHA256SUMS.txt", asset_name()))?;
-    let f2 = file.clone();
-    let actual = tokio::task::spawn_blocking(move || sha256_file(&f2)).await??;
-    if actual != expected {
-        let _ = std::fs::remove_file(&file);
-        return Err(anyhow!("the download doesn't match the release's checksum - nothing was installed"));
-    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    crate::download::download(app, "app-update", &format!("Lumen {}", rel.version), &rel.file, &file, Some(&expected), cancel).await?;
     let app_dir = exe.parent().ok_or_else(|| anyhow!("cannot locate Lumen's folder"))?;
 
     #[cfg(windows)]
@@ -293,20 +285,6 @@ fn expected_hash(sums: &str, name: &str) -> Option<String> {
         let (hash, n) = (it.next()?, it.next()?.trim_start_matches('*'));
         (n == name && hash.len() == 64).then(|| hash.to_ascii_lowercase())
     })
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut f = std::fs::File::open(path)?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The setup's options for an update (lumen.iss): on this folder, a progress window but no questions,
@@ -397,8 +375,6 @@ pub fn cleanup(state: &AppState) {
         for p in [sibling(&exe, "old"), sibling(&exe, "new")] {
             let _ = std::fs::remove_file(p);
         }
-        // (pre-0.9 Windows updates left lumen.exe.old)
-        let _ = std::fs::remove_file(exe.with_extension("exe.old"));
     }
     let _ = std::fs::remove_dir_all(state.paths.root.join("updates"));
 }
@@ -516,14 +492,5 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the setup did not finish:\n{text}");
             std::thread::sleep(Duration::from_millis(500));
         }
-    }
-
-    #[test]
-    fn sha256_matches_known_value() {
-        let p = std::env::temp_dir().join(format!("lumen-sha-{}", crate::state::new_id()));
-        std::fs::write(&p, b"abc").unwrap();
-        let h = sha256_file(&p).unwrap();
-        let _ = std::fs::remove_file(&p);
-        assert_eq!(h, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 }

@@ -521,7 +521,8 @@ so the user can ask you to continue.]";
 /// (before, the loop just stopped after the last tool result - the user saw reasoning and no answer).
 async fn run_turn(app: &AppHandle, chat_id: &str, project: Option<&Project>, think: bool, web: bool, cancel: &AtomicBool) -> Result<()> {
     let state = app.state::<Arc<AppState>>().inner().clone();
-    let defs = tools::definitions(project.is_some(), web);
+    let mut defs = tools::definitions(project.is_some(), web);
+    defs.extend(crate::mcp::definitions(app).await);
     let ctx = ToolCtx { app, project, chat_id, cancel, web };
     let mut answered = false;
     for round in 0..MAX_ROUNDS {

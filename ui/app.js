@@ -63,6 +63,7 @@ const ICONS = {
   code: '<path d="m8 7-5 5 5 5M16 7l5 5-5 5"/>',
   shield: '<path d="M12 3 4 6v6c0 4.5 3.4 8.3 8 9 4.6-.7 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/>',
   diff: '<path d="M6 3v12M3 6h6M15 18h6"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>',
+  plug: '<path d="M9 2v6M15 2v6M6 8h12v4a6 6 0 0 1-12 0zM12 18v4"/>',
 };
 const icon = (n, cls = "") => `<svg class="i ${cls}" viewBox="0 0 24 24">${ICONS[n] || ""}</svg>`;
 
@@ -80,6 +81,7 @@ const S = {
   updates: {}, // from updater.rs: { current, app: {version,url}|null, runtime: tag|null, runtime_current, checking, installing, error }
   lastPromptTps: 0, engineOpen: false,
   confirms: {}, // tool_confirm requests still waiting for the user's answer, by id
+  mcp: { error: "", servers: [] }, // MCP servers from Settings and their state (mcp.rs)
 };
 /** Translate key `k` in the current UI language (falls back to English), filling {placeholders}. */
 const t = (k, vars) => {
@@ -620,7 +622,7 @@ function userEl(m) {
     a.innerHTML = `<span class="chip" style="border-style:dashed">${icon("layers")}${t("retrieved")}</span>` + ret.slice(0, 6).map((r) => `<span class="chip">${icon("file")}${esc(r.path)}:${esc(r.lines)}</span>`).join("");
     n.insertBefore(a, n.querySelector(".msg-tools"));
   }
-  if (m.meta?.research) n.querySelector(".bubble").insertAdjacentHTML("afterbegin", `<div style="font-size:11.5px;color:#aee6ff;display:flex;gap:5px;align-items:center;margin-bottom:4px">${icon("telescope")}${t("research")}</div>`);
+  if (m.meta?.research) n.querySelector(".bubble").insertAdjacentHTML("afterbegin", `<div style="font-size:11.5px;color:var(--accent);display:flex;gap:5px;align-items:center;margin-bottom:4px">${icon("telescope")}${t("research")}</div>`);
   const tools = n.querySelector(".msg-tools");
   tools.innerHTML = `<button data-a="copy" title="${t("copy")}">${icon("copy")}</button><button data-a="edit">${icon("edit")}${t("edit")}</button><button data-a="del" title="${t("deleteExchange")}">${icon("trash")}</button>`;
   tools.onclick = (e) => {
@@ -721,6 +723,12 @@ const TOOL_ICON = {
   grep: "search", file_outline: "code", find_symbol: "code", compare_files: "diff", git_status: "git", git_diff: "git",
   run_command: "terminal", report_findings: "shield", audit_code: "shield", calculate: "calc", current_datetime: "clock",
 };
+/** Label of a tool in the chat: its translated name, or "server › tool" for an MCP tool. */
+function toolName(name) {
+  const m = /^mcp__(.+?)__(.+)$/.exec(name || "");
+  return m ? `${m[1]} › ${m[2]}` : t(TOOL_LABEL[name] || name);
+}
+const toolIcon = (name) => TOOL_ICON[name] || (/^mcp__/.test(name || "") ? "plug" : "bolt");
 function toolArgSummary(name, argsRaw) {
   let a = {};
   try { a = JSON.parse(argsRaw || "{}"); } catch {}
@@ -779,9 +787,11 @@ function gitDiffEl(d, m) {
 }
 /** The "allow this process?" prompt shown on a running git / run_command tool. */
 function confirmEl(p) {
-  const n = el(`<div class="confirm" data-confirm="${esc(p.id)}"><div class="confirm-q">${icon(p.scope === "git" ? "git" : "terminal")}<span>${esc(t(p.scope === "git" ? "confirmGit" : "confirmRun"))}</span></div><pre class="confirm-cmd"></pre><div class="confirm-cwd"></div><div class="confirm-b"><button class="btn primary" data-d="allow">${icon("play")}${esc(t("confirmAllow"))}</button><button class="btn" data-d="always">${esc(t("confirmAlways"))}</button><button class="btn" data-d="deny">${icon("x")}${esc(t("confirmDeny"))}</button></div></div>`);
+  const mcp = String(p.scope || "").startsWith("mcp:");
+  const n = el(`<div class="confirm" data-confirm="${esc(p.id)}"><div class="confirm-q">${icon(p.scope === "git" ? "git" : mcp ? "plug" : "terminal")}<span>${esc(t(p.scope === "git" ? "confirmGit" : mcp ? "confirmMcp" : "confirmRun"))}</span></div><pre class="confirm-cmd"></pre><div class="confirm-cwd"></div><div class="confirm-b"><button class="btn primary" data-d="allow">${icon("play")}${esc(t("confirmAllow"))}</button><button class="btn" data-d="always">${esc(t("confirmAlways"))}</button><button class="btn" data-d="deny">${icon("x")}${esc(t("confirmDeny"))}</button></div></div>`);
   n.querySelector(".confirm-cmd").textContent = p.command;
-  n.querySelector(".confirm-cwd").textContent = t("confirmIn", { dir: p.cwd });
+  if (p.cwd) n.querySelector(".confirm-cwd").textContent = t("confirmIn", { dir: p.cwd });
+  else n.querySelector(".confirm-cwd").remove();
   n.querySelector(".confirm-b").onclick = async (e) => {
     const b = e.target.closest("button"); if (!b) return;
     n.querySelectorAll("button").forEach((x) => (x.disabled = true));
@@ -797,7 +807,7 @@ function showConfirm(p) {
   scrollBottom(true);
 }
 function runningToolEl(id, name, args) {
-  return el(`<div class="tool" data-call="${esc(id)}"><div class="tool-h">${icon(TOOL_ICON[name] || "bolt")}<span class="name">${esc(t(TOOL_LABEL[name] || name))}</span><span class="arg">${esc(toolArgSummary(name, args))}</span><span class="st"><span class="spinner"></span></span></div></div>`);
+  return el(`<div class="tool" data-call="${esc(id)}"><div class="tool-h">${icon(toolIcon(name))}<span class="name">${esc(toolName(name))}</span><span class="arg">${esc(toolArgSummary(name, args))}</span><span class="st"><span class="spinner"></span></span></div></div>`);
 }
 function toolEl(m) {
   const d = m.meta?.display || {};
@@ -805,7 +815,7 @@ function toolEl(m) {
   if (d.kind === "diff") return diffEl(d, m);
   if (d.kind === "findings") return findingsEl(d, m);
   if (d.kind === "gitdiff") return gitDiffEl(d, m);
-  const n = el(`<div class="tool" data-call="${esc(m.meta?.tool_call_id || "")}"><div class="tool-h">${icon(TOOL_ICON[name] || "bolt")}<span class="name">${esc(t(TOOL_LABEL[name] || name))}</span><span class="arg">${esc(toolArgSummary(name, m.meta?.arguments))}${d.lines ? " · " + esc(d.lines) : ""}</span><span class="st">${m.meta?.ok ? icon("check", "ok-ic") : icon("x", "bad-ic")}${icon("chevron")}</span></div><div class="tool-b"></div></div>`);
+  const n = el(`<div class="tool" data-call="${esc(m.meta?.tool_call_id || "")}"><div class="tool-h">${icon(toolIcon(name))}<span class="name">${esc(toolName(name))}</span><span class="arg">${esc(toolArgSummary(name, m.meta?.arguments))}${d.lines ? " · " + esc(d.lines) : ""}</span><span class="st">${m.meta?.ok ? icon("check", "ok-ic") : icon("x", "bad-ic")}${icon("chevron")}</span></div><div class="tool-b"></div></div>`);
   const full = m.meta?.full || m.content; // pruned / clipped results keep the original for the UI
   n.querySelector(".tool-b").textContent = full.length > 20000 ? full.slice(0, 20000) + "\n…" : full;
   if (m.meta?.pruned || m.meta?.clipped) n.querySelector(".tool-h .arg").insertAdjacentHTML("afterend", `<span class="res" title="${esc(t(m.meta.pruned ? "prunedHint" : "clippedHint"))}">${icon("compress")}</span>`);
@@ -890,7 +900,7 @@ function eventEl(m) {
     const pct = Math.round((meta.progress || 0) * 100);
     const steps = (meta.steps || []).slice(-8);
     const stepIc = { plan: "list", search: "search", read: "book", think: "brain", write: "edit", done: "check", warn: "warn" };
-    const n = el(`<div class="event" data-id="${m.id}"><div class="event-h"><span class="ic" style="background:rgba(34,184,240,.14);color:#aee6ff">${icon("telescope")}</span>${stopped ? t("researching") + " ✕" : done ? t("researchDone") : t("researching") + "…"}<small>${pct}% · ${(meta.sources || []).length} ${t("sources").toLowerCase()}</small></div>
+    const n = el(`<div class="event" data-id="${m.id}"><div class="event-h"><span class="ic" style="background:var(--accent-soft);color:var(--accent)">${icon("telescope")}</span>${stopped ? t("researching") + " ✕" : done ? t("researchDone") : t("researching") + "…"}<small>${pct}% · ${(meta.sources || []).length} ${t("sources").toLowerCase()}</small></div>
       <div class="prog ${done ? "done" : ""}"><div style="width:${pct}%"></div></div>
       ${meta.objective ? `<div style="font-size:13px;color:var(--text-2)">${esc(meta.objective)}</div>` : ""}
       <div class="steps">${steps.map((s) => `<div>${icon(stepIc[s.icon] || "sparkle")}<span>${esc(s.text)}</span></div>`).join("")}</div>
@@ -1230,6 +1240,8 @@ function renderSettings() {
     html += f(t("apiKey"), `<a href="${link}">${link}</a>`, `<input class="inp" type="password" data-k="search_key" value="${esc(s.search_key)}" placeholder="key"/>`);
   }
   if (s.search_provider === "searxng") html += f("SearXNG URL", t("searxHint"), `<input class="inp" data-k="searxng_url" value="${esc(s.searxng_url)}" placeholder="http://localhost:8080"/>`);
+  html += `<h3>${icon("plug")}${t("mcpSection")}</h3>`;
+  html += `<div class="field col"><div><label>${t("mcpLabel")}</label><small>${esc(t("mcpHint"))}</small></div><textarea class="inp mono" id="mcpConfig" spellcheck="false" placeholder="${esc(MCP_EXAMPLE)}">${esc(prettyJson(s.mcp_config))}</textarea><div class="btn-row"><button class="btn primary" id="mcpSave">${icon("check")}${t("mcpSave")}</button><button class="btn" id="mcpReconnect">${icon("refresh")}${t("mcpReconnect")}</button></div><div class="mcp-list" id="mcpList">${mcpListHtml()}</div></div>`;
   html += `<h3>${icon("gear")}${t("appSection")}</h3>`;
   html += f(t("tray"), t("trayHint"), sw("close_to_tray"));
   html += f(t("autoload"), "", sw("autoload_model"));
@@ -1248,7 +1260,25 @@ function renderSettings() {
   html += `<h3>${icon("list")}${t("logs")} <button class="btn ghost" id="logRef" style="margin-left:auto">${icon("refresh")}${t("refresh")}</button></h3><div class="logs" id="logs"></div>`;
   $("#settingsPage").innerHTML = html;
   loadLogs();
+  invoke("mcp_status").then((m) => { S.mcp = m; renderMcpList(); }).catch(() => {});
 }
+/** JSON text indented for reading (left as it is when it doesn't parse). */
+function prettyJson(text) {
+  try { return text ? JSON.stringify(JSON.parse(text), null, 2) : ""; } catch { return text; }
+}
+const MCP_EXAMPLE ='{"mcpServers": {"files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/notes"]}}}';
+/** One row per configured MCP server: its state, tool count and the error if it failed. */
+function mcpListHtml() {
+  const m = S.mcp || {};
+  if (m.error) return `<div class="mcp-row"><span class="dot error"></span><span class="mcp-err">${esc(m.error)}</span></div>`;
+  if (!m.servers?.length) return `<div class="muted-note">${esc(t("mcpNone"))}</div>`;
+  return m.servers.map((x) => {
+    const dot = { ready: "ready", error: "error", connecting: "starting" }[x.state] || "";
+    const info = [t("mcpSt_" + x.state), x.state === "ready" ? t("mcpTools", { n: x.tools.length }) : "", x.transport, x.trust ? t("mcpTrusted") : ""].filter(Boolean).join(" · ");
+    return `<div class="mcp-row" title="${esc(x.tools.join(", "))}"><span class="dot ${dot}"></span><b>${esc(x.name)}</b><span class="mcp-info">${esc(info)}</span>${x.error ? `<div class="mcp-err">${esc(x.error)}</div>` : ""}</div>`;
+  }).join("");
+}
+function renderMcpList() { const n = $("#mcpList"); if (n) n.innerHTML = mcpListHtml(); }
 async function loadLogs() { const l = await invoke("get_logs"); const n = $("#logs"); if (n) { n.textContent = l.slice(-250).join("\n") || "—"; n.scrollTop = n.scrollHeight; } }
 $("#settingsPage").addEventListener("change", async (e) => {
   const k = e.target.dataset.k;
@@ -1279,6 +1309,13 @@ $("#settingsPage").addEventListener("click", async (e) => {
   if (id === "checkUpd") checkUpdatesNow();
   if (id === "installUpd") promptAppUpdate();
   if (id === "rtUpd") promptRuntimeUpdate();
+  if (id === "mcpSave") {
+    const prev = S.settings.mcp_config;
+    S.settings.mcp_config = $("#mcpConfig").value.trim();
+    try { await call("set_settings", { settings: S.settings }); toast(t("mcpSaved")); S.mcp = await invoke("mcp_status"); renderMcpList(); }
+    catch { S.settings.mcp_config = prev; } // (invalid JSON: the error toast says why; nothing was saved)
+  }
+  if (id === "mcpReconnect") invoke("mcp_reconnect");
 });
 
 // ---------------------------------------------------------------- projects
@@ -1445,6 +1482,7 @@ listen("server-status", (e) => {
   if (S.view === "models") renderModels();
 });
 listen("metrics", (e) => { S.metrics = e.payload; renderStatus(); });
+listen("mcp-status", (e) => { S.mcp = e.payload; renderMcpList(); });
 listen("update-status", (e) => {
   const prev = S.updates?.app?.version;
   S.updates = e.payload;
@@ -1519,7 +1557,7 @@ listen("chat-event", (e) => {
     case "progress": liveProgress(p); break;
     case "tool_pending": {
       if (S.live && S.live.tempId === p.temp_id && !S.live.seg.querySelector(".pending-tool")) {
-        S.live.seg.appendChild(el(`<div class="tool pending-tool"><div class="tool-h"><span class="spinner"></span><span class="name">${esc(t(TOOL_LABEL[p.name] || p.name))}</span></div></div>`));
+        S.live.seg.appendChild(el(`<div class="tool pending-tool"><div class="tool-h"><span class="spinner"></span><span class="name">${esc(toolName(p.name))}</span></div></div>`));
       }
       break;
     }

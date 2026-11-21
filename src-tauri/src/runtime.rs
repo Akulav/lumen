@@ -121,8 +121,10 @@ pub struct Release {
     pub tag: String,
     pub url: String,
     pub name: String,
-    /// (url, file name) of the `cudart-…` file
-    pub cudart: Option<(String, String)>,
+    /// SHA-256 GitHub publishes for the file (its `digest`): a download must match it
+    pub sha256: String,
+    /// (url, file name, SHA-256) of the `cudart-…` file
+    pub cudart: Option<(String, String, String)>,
 }
 
 /// Newest llama.cpp release that has a build for this system and `backend` (a settings value).
@@ -147,18 +149,22 @@ pub async fn latest_release(state: &AppState, backend: &str) -> Result<Release> 
         .ok_or_else(|| anyhow!("no llama.cpp release has a build for '{build}' on this system"))
 }
 
-/// The files of one GitHub release for `build`; None if it lacks one (a CUDA build also needs its cudart file).
+/// The files of one GitHub release for `build`; None if it lacks one (a CUDA build also needs its cudart file)
+/// or GitHub has no SHA-256 for it (the runtime is a program: it is never run unchecked).
 fn pick_release(r: &Value, build: &str) -> Option<Release> {
     let tag = r["tag_name"].as_str()?.to_string();
     let assets = r["assets"].as_array()?;
-    let file = |a: &Value| Some((a["browser_download_url"].as_str()?.to_string(), a["name"].as_str()?.to_string()));
-    let (url, name) = assets.iter().filter_map(file).find(|(_, n)| asset_matches(n, build))?;
+    let file = |a: &Value| {
+        let sha = crate::download::parse_sha256(a["digest"].as_str()?)?;
+        Some((a["browser_download_url"].as_str()?.to_string(), a["name"].as_str()?.to_string(), sha))
+    };
+    let (url, name, sha256) = assets.iter().filter_map(file).find(|(_, n, _)| asset_matches(n, build))?;
     let cudart = if build.starts_with("cuda") {
-        Some(assets.iter().filter_map(file).find(|(_, n)| cudart_matches(n, &name, &tag))?)
+        Some(assets.iter().filter_map(file).find(|(_, n, _)| cudart_matches(n, &name, &tag))?)
     } else {
         None
     };
-    Some(Release { tag, url, name, cudart })
+    Some(Release { tag, url, name, sha256, cudart })
 }
 
 /// Unpacks a llama.cpp archive (.zip or .tar.gz) into `dest`, keeping the executable bits.
@@ -215,17 +221,17 @@ pub async fn ensure(app: &AppHandle, backend: &str, force: bool) -> Result<PathB
         return Ok(exe);
     }
     state.log(format!("[runtime] fetching llama.cpp ({backend}) release list"));
-    let Release { tag, url, name, cudart } = latest_release(&state, backend).await?;
+    let Release { tag, url, name, sha256, cudart } = latest_release(&state, backend).await?;
 
     let tmp_zip = state.paths.runtime.join(&name);
     let cancel = Arc::new(AtomicBool::new(false));
-    crate::download::download(app, &state.http, "runtime", &format!("llama.cpp {tag} ({backend})"), &url, &tmp_zip, cancel.clone())
+    crate::download::download(app, "runtime", &format!("llama.cpp {tag} ({backend})"), &url, &tmp_zip, Some(&sha256), cancel.clone())
         .await
         .context("downloading llama.cpp")?;
     let tmp_cudart = match &cudart {
-        Some((url, name)) => {
+        Some((url, name, sha)) => {
             let path = state.paths.runtime.join(name);
-            crate::download::download(app, &state.http, "runtime", "NVIDIA CUDA runtime", url, &path, cancel)
+            crate::download::download(app, "runtime", "NVIDIA CUDA runtime", url, &path, Some(sha), cancel)
                 .await
                 .context("downloading the CUDA runtime")?;
             Some(path)
@@ -382,7 +388,7 @@ mod tests {
     ];
 
     fn release_json(names: &[&str]) -> Value {
-        let assets: Vec<Value> = names.iter().map(|n| serde_json::json!({"name": n, "browser_download_url": format!("https://x/{n}")})).collect();
+        let assets: Vec<Value> = names.iter().map(|n| serde_json::json!({"name": n, "browser_download_url": format!("https://x/{n}"), "digest": format!("sha256:{}", "ab".repeat(32))})).collect();
         serde_json::json!({"tag_name": "b12194", "assets": assets})
     }
 
@@ -405,6 +411,12 @@ mod tests {
             let partial: Vec<&str> = B12194.iter().copied().filter(|n| !n.starts_with("cudart-")).collect();
             assert!(pick_release(&release_json(&partial), "cuda-12").is_none());
             assert!(pick_release(&release_json(&partial), "vulkan").is_some());
+            // no published SHA-256: not installed
+            let mut unsigned = release_json(B12194);
+            for a in unsigned["assets"].as_array_mut().unwrap() {
+                a.as_object_mut().unwrap().remove("digest");
+            }
+            assert!(pick_release(&unsigned, "vulkan").is_none());
         }
     }
 
@@ -425,7 +437,7 @@ mod tests {
             let list: Value = http.get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5").send().await.unwrap().json().await.unwrap();
             let rel = list.as_array().unwrap().iter().find_map(|r| pick_release(r, "cuda-12")).expect("a release with a CUDA 12 build");
             let mut files = vec![(rel.url.clone(), rel.name.clone())];
-            files.extend(rel.cudart.clone());
+            files.extend(rel.cudart.clone().map(|c| (c.0, c.1)));
             for (url, name) in files {
                 let path = cache.join(&name);
                 if path.exists() {

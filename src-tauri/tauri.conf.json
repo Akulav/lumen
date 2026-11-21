@@ -19,7 +19,7 @@
         "minHeight": 620,
         "center": true,
         "theme": "Dark",
-        "backgroundColor": "#0d0f14"
+        "backgroundColor": "#202020"
       }
     ],
     "security": {
@@ -33,7 +33,7 @@
     "category": "Productivity",
     "shortDescription": "Lumen - local AI",
     "longDescription": "Chat with local language models on your own PC. Nothing leaves the computer.",
-    "homepage": "https://github.com/Akulav/local-ai-ui",
+    "homepage": "https://github.com/Akulav/lumen",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

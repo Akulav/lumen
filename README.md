@@ -8,9 +8,9 @@
 
 No cloud. No telemetry. No setup to babysit. One file per system that installs and updates itself.
 
-[![Latest release](https://img.shields.io/github/v/release/Akulav/local-ai-ui?style=for-the-badge&label=release&color=e5383b)](https://github.com/Akulav/local-ai-ui/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/Akulav/local-ai-ui/total?style=for-the-badge&color=f4b740)](https://github.com/Akulav/local-ai-ui/releases)
-[![Build](https://img.shields.io/github/actions/workflow/status/Akulav/local-ai-ui/release.yml?branch=main&style=for-the-badge&label=build)](https://github.com/Akulav/local-ai-ui/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/Akulav/lumen?style=for-the-badge&label=release&color=e5383b)](https://github.com/Akulav/lumen/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Akulav/lumen/total?style=for-the-badge&color=f4b740)](https://github.com/Akulav/lumen/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/Akulav/lumen/release.yml?branch=main&style=for-the-badge&label=build)](https://github.com/Akulav/lumen/actions/workflows/release.yml)
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=flat-square&logo=windows&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-x64-FCC624?style=flat-square&logo=linux&logoColor=black)
@@ -18,7 +18,9 @@ No cloud. No telemetry. No setup to babysit. One file per system that installs a
 ![Rust](https://img.shields.io/badge/made%20with-Rust%20%2B%20Tauri-B7410E?style=flat-square&logo=rust&logoColor=white)
 ![License](https://img.shields.io/badge/license-source--available-5c6270?style=flat-square)
 
-### [⬇ Download the latest release](https://github.com/Akulav/local-ai-ui/releases/latest)
+[Download](#%EF%B8%8F-download) · [Features](#-features) · [Getting started](#-getting-started) · [MCP servers](#-mcp-servers) · [Data](#-where-your-data-lives) · [Privacy](#-privacy-and-safety) · [Docs](#-documentation)
+
+### [⬇ Download the latest release](https://github.com/Akulav/lumen/releases/latest)
 
 </div>
 
@@ -30,9 +32,9 @@ One file per system. The same file installs Lumen the first time and updates it 
 
 | Platform | File | Notes |
 | :-- | :-- | :-- |
-| 🪟 **Windows 10 / 11** (x64) | [`Lumen-setup.exe`](https://github.com/Akulav/local-ai-ui/releases/latest/download/Lumen-setup.exe) | Asks where to install (English / Romanian). No admin rights needed. |
-| 🐧 **Linux** (x64) | [`lumen-linux-x64`](https://github.com/Akulav/local-ai-ui/releases/latest/download/lumen-linux-x64) | WebKitGTK 4.1 desktop |
-| 🍎 **macOS** (Apple Silicon) | [`lumen-macos-arm64`](https://github.com/Akulav/local-ai-ui/releases/latest/download/lumen-macos-arm64) | macOS 11+ |
+| 🪟 **Windows 10 / 11** (x64) | [`Lumen-setup.exe`](https://github.com/Akulav/lumen/releases/latest/download/Lumen-setup.exe) | Asks where to install (English / Romanian). No admin rights needed. |
+| 🐧 **Linux** (x64) | [`lumen-linux-x64`](https://github.com/Akulav/lumen/releases/latest/download/lumen-linux-x64) | WebKitGTK 4.1 desktop |
+| 🍎 **macOS** (Apple Silicon) | [`lumen-macos-arm64`](https://github.com/Akulav/lumen/releases/latest/download/lumen-macos-arm64) | macOS 11+ |
 
 Every release also ships `SHA256SUMS.txt` so you can verify your download.
 
@@ -54,6 +56,7 @@ Every release also ships `SHA256SUMS.txt` so you can verify your download.
 - Link a folder: hybrid search (BM25 + embeddings), grep, outline, find symbols, git status / diff.
 - Edits are diff cards with **Undo**; whole-codebase audits; runs your tests after you allow the command.
 - **Deep research** plans, searches, reads and writes a cited report.
+- **MCP servers**: tools from any Model Context Protocol server (local program or URL), each call confirmed.
 
 </td>
 </tr>
@@ -103,8 +106,7 @@ chmod +x lumen-macos-arm64
 xattr -d com.apple.quarantine lumen-macos-arm64
 ./lumen-macos-arm64
 ```
-It asks for an install folder (default `~/Applications/Lumen`) and creates `Lumen.app` there. An older
-`~/Applications/Lumen.app` and its data move into the folder.
+It asks for an install folder (default `~/Applications/Lumen`) and creates `Lumen.app` there.
 
 ### First chat
 1. **Start Lumen.** It downloads the llama.cpp engine (about 100 MB) on its own.
@@ -114,6 +116,24 @@ It asks for an install folder (default `~/Applications/Lumen`) and creates `Lume
 > [!TIP]
 > Web search works without a key (DuckDuckGo instant answers + Wikipedia). For full web results add a free
 > [Brave Search API](https://brave.com/search/api/) key (or Tavily, or your own SearXNG) in **Settings → Web search**.
+
+## 🔌 MCP servers
+
+In **Settings → MCP servers**, paste servers in the usual `mcpServers` JSON format (the same one other MCP apps use):
+
+```json
+{
+  "mcpServers": {
+    "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/notes"] },
+    "remote": { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer …" } }
+  }
+}
+```
+
+- `command` + `args` (+ `env`, `cwd`) starts a local program over stdio; `url` (+ `headers`) talks Streamable HTTP.
+- Servers start with the first chat that needs tools; Settings shows each one's state and tools, and **Reconnect** restarts them.
+- The model sees their tools as `mcp__<server>__<tool>`. Lumen asks in the chat before every call (*Run* / *Always in this
+  chat* / *Deny*) unless the server has `"trust": true`; `disabled: true` keeps a server configured but off.
 
 ## 📁 Where your data lives
 
@@ -148,7 +168,10 @@ Closing the window keeps Lumen and the loaded model running in the tray (menu ba
   engine, updates) and, only when you turn it on, web search through official APIs.
 - File tools stay inside the project folder and back a file up before changing it; commands run only after you allow
   them in the window.
-- Updates install only files whose SHA-256 matches the release's `SHA256SUMS.txt`.
+- Updates install only files whose SHA-256 matches the release's `SHA256SUMS.txt`; the llama.cpp engine only when it
+  matches the SHA-256 GitHub publishes for it, and models are checked against Hugging Face's SHA-256.
+- The local llama.cpp servers answer only to Lumen (a random key per run), so web pages can't use your model.
+- MCP tools run only after you allow them; what they return never unlocks links for the model.
 
 <details>
 <summary><b>🛠️ For maintainers: updates, releases and building</b></summary>
@@ -181,10 +204,17 @@ The llama.cpp engine is offered the same way. A copy built from source never rep
 
 </details>
 
+## 📚 Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) – how the app is put together: processes, modules, data flow, security.
+- [CHANGELOG.md](CHANGELOG.md) – what changed in each release.
+
 ## 🙏 Credits
 
 Inference by [llama.cpp](https://github.com/ggml-org/llama.cpp). Built with [Tauri](https://tauri.app). Markdown by
-marked, sanitising by DOMPurify, highlighting by highlight.js (see `ui/vendor`).
+[marked](https://github.com/markedjs/marked), sanitising by [DOMPurify](https://github.com/cure53/DOMPurify), highlighting by
+[highlight.js](https://highlightjs.org) (bundled in `ui/vendor`, nothing loads from the internet). Tools from MCP servers
+follow the [Model Context Protocol](https://modelcontextprotocol.io).
 
 ---
 

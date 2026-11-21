@@ -36,15 +36,38 @@ pub fn get_state(app: AppHandle, state: S) -> Value {
 }
 
 #[tauri::command]
-pub fn set_settings(app: AppHandle, state: S, mut settings: Settings) {
-    {
+pub fn set_settings(app: AppHandle, state: S, mut settings: Settings) -> R<()> {
+    crate::mcp::parse_config(&settings.mcp_config).map_err(e)?;
+    let mcp_changed = {
         let mut cur = state.settings.write();
         settings.last_n_ctx = cur.last_n_ctx; // the backend's to set; the window's copy may be older
+        let changed = cur.mcp_config != settings.mcp_config;
         *cur = settings;
+        changed
+    };
+    if mcp_changed {
+        // the servers restart with the new configuration
+        state.mcp.reset();
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move { crate::mcp::connect(&app, true).await });
     }
     state.save_settings();
     let updates = state.updates.read().clone();
     crate::refresh_tray(&app, &updates); // tray labels follow the UI language
+    Ok(())
+}
+
+/// MCP servers from Settings and how they are doing (`mcp-status` events follow changes).
+#[tauri::command]
+pub fn mcp_status(state: S) -> Value {
+    state.mcp.statuses(&state)
+}
+
+/// Restarts the MCP servers (Settings → Reconnect); the result comes as an `mcp-status` event.
+#[tauri::command]
+pub fn mcp_reconnect(app: AppHandle, state: S) {
+    state.mcp.reset();
+    tauri::async_runtime::spawn(async move { crate::mcp::connect(&app, true).await });
 }
 
 #[tauri::command]
