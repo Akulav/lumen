@@ -136,7 +136,8 @@ enum Conn {
         pending: Pending,
     },
     Http {
-        url: String,
+        /// the configured address, or where the server redirected it to
+        url: Mutex<String>,
         headers: reqwest::header::HeaderMap,
         session: Mutex<Option<String>>,
         version: Mutex<Option<String>>,
@@ -216,15 +217,15 @@ impl Server {
         }
     }
 
-    async fn notify(&self, state: &AppState, method: &str, params: Value) -> Result<()> {
+    async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
         match &self.conn {
             Conn::Stdio { stdin, .. } => write_line(stdin, &msg).await,
-            Conn::Http { .. } => self.http_post(state, &msg, None).await.map(|_| ()),
+            Conn::Http { .. } => self.http_post(&msg, None).await.map(|_| ()),
         }
     }
 
-    async fn request(&self, state: &AppState, method: &str, params: Value, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<Value> {
+    async fn request(&self, method: &str, params: Value, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let fut = async {
@@ -238,7 +239,7 @@ impl Server {
                     }
                     rx.await.map_err(|_| anyhow!("the server closed"))
                 }
-                Conn::Http { .. } => self.http_post(state, &msg, Some(id)).await?.ok_or_else(|| anyhow!("the server sent no answer")),
+                Conn::Http { .. } => self.http_post(&msg, Some(id)).await?.ok_or_else(|| anyhow!("the server sent no answer")),
             }
         };
         let stopped = async {
@@ -262,7 +263,7 @@ impl Server {
         let reply = match reply {
             Ok(r) => r,
             Err(e) => {
-                let _ = self.notify(state, "notifications/cancelled", json!({"requestId": id, "reason": e.to_string()})).await;
+                let _ = self.notify("notifications/cancelled", json!({"requestId": id, "reason": e.to_string()})).await;
                 return Err(e);
             }
         };
@@ -273,26 +274,41 @@ impl Server {
     }
 
     /// Streamable HTTP: one POST per message; the answer is JSON or an SSE stream that carries it.
-    async fn http_post(&self, state: &AppState, msg: &Value, id: Option<u64>) -> Result<Option<Value>> {
+    /// Redirects are followed here, not by reqwest: a 301/302 would turn the POST into a GET (which MCP
+    /// servers refuse with 405). Only redirects on the same host are followed (http -> https, another path),
+    /// so the configured headers (a bearer token) never go to another site; the new address is kept.
+    async fn http_post(&self, msg: &Value, id: Option<u64>) -> Result<Option<Value>> {
         let Conn::Http { url, headers, session, version } = &self.conn else { unreachable!() };
-        let mut req = state
-            .http
-            .post(url)
-            .headers(headers.clone())
-            .header("User-Agent", LUMEN_UA)
-            .header("Accept", "application/json, text/event-stream")
-            .json(msg);
-        if let Some(s) = session.lock().clone() {
-            req = req.header("Mcp-Session-Id", s);
-        }
-        if let Some(v) = version.lock().clone() {
-            req = req.header("MCP-Protocol-Version", v);
-        }
-        let resp = req.send().await?;
+        let mut target = url.lock().clone();
+        let mut hops = 0;
+        let resp = loop {
+            let mut req = mcp_http()
+                .post(&target)
+                .headers(headers.clone())
+                .header("Accept", "application/json, text/event-stream")
+                .json(msg);
+            if let Some(s) = session.lock().clone() {
+                req = req.header("Mcp-Session-Id", s);
+            }
+            if let Some(v) = version.lock().clone() {
+                req = req.header("MCP-Protocol-Version", v);
+            }
+            let resp = req.send().await?;
+            if !resp.status().is_redirection() {
+                break resp;
+            }
+            let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+            let next = redirect_target(&target, &location)?;
+            hops += 1;
+            if hops > 5 {
+                return Err(anyhow!("too many redirects (last: {next})"));
+            }
+            *url.lock() = next.clone();
+            target = next;
+        };
         if let Some(s) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
             *session.lock() = Some(s.to_string());
-        }
-        let status = resp.status();
+        }        let status = resp.status();
         if !status.is_success() {
             let body: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
             return Err(anyhow!("HTTP {status} {body}"));
@@ -322,6 +338,33 @@ impl Server {
         }
         Ok(None)
     }
+}
+
+/// HTTP client for MCP servers: follows no redirects by itself (see `Server::http_post`).
+fn mcp_http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(LUMEN_UA)
+            .connect_timeout(Duration::from_secs(20))
+            .build()
+            .expect("MCP HTTP client")
+    })
+}
+
+/// Where a redirect from `from` to `location` leads, if it stays on the same host.
+fn redirect_target(from: &str, location: &str) -> Result<String> {
+    let base = reqwest::Url::parse(from)?;
+    let next = base.join(location.trim()).map_err(|_| anyhow!("the server redirected to an invalid address `{location}`"))?;
+    if !matches!(next.scheme(), "http" | "https") || next.host_str() != base.host_str() {
+        return Err(anyhow!("the server redirects to {next} - put that address in the MCP settings if you trust it"));
+    }
+    // (https -> http would drop the encryption the configured headers rely on)
+    if base.scheme() == "https" && next.scheme() == "http" {
+        return Err(anyhow!("the server redirects from https to http ({next}); not followed"));
+    }
+    Ok(next.to_string())
 }
 
 /// The JSON-RPC answer with `id` in a message or a batch.
@@ -425,10 +468,10 @@ async fn start(state: &AppState, cfg: &ServerConfig) -> Result<Server> {
             let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).with_context(|| format!("bad header name `{k}`"))?;
             headers.insert(name, v.parse().with_context(|| format!("bad value for header `{k}`"))?);
         }
-        Conn::Http { url, headers, session: Mutex::new(None), version: Mutex::new(None) }
+        Conn::Http { url: Mutex::new(url), headers, session: Mutex::new(None), version: Mutex::new(None) }
     };
     let mut server = Server { cfg: cfg.clone(), conn, next_id: AtomicU64::new(1), tools: vec![] };
-    if let Err(e) = initialize(state, &mut server).await {
+    if let Err(e) = initialize(&mut server).await {
         server.shutdown();
         return Err(e);
     }
@@ -436,17 +479,17 @@ async fn start(state: &AppState, cfg: &ServerConfig) -> Result<Server> {
 }
 
 /// The MCP handshake, then the tool list.
-async fn initialize(state: &AppState, server: &mut Server) -> Result<()> {
+async fn initialize(server: &mut Server) -> Result<()> {
     let params = json!({
         "protocolVersion": PROTOCOL,
         "capabilities": {},
         "clientInfo": {"name": "Lumen", "version": env!("CARGO_PKG_VERSION")}
     });
-    let init = server.request(state, "initialize", params, INIT_TIMEOUT, None).await.context("no MCP handshake")?;
+    let init = server.request("initialize", params, INIT_TIMEOUT, None).await.context("no MCP handshake")?;
     if let Conn::Http { version, .. } = &server.conn {
         *version.lock() = Some(init["protocolVersion"].as_str().unwrap_or(PROTOCOL).to_string());
     }
-    server.notify(state, "notifications/initialized", json!({})).await?;
+    server.notify("notifications/initialized", json!({})).await?;
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..20 {
@@ -454,7 +497,7 @@ async fn initialize(state: &AppState, server: &mut Server) -> Result<()> {
             Some(c) => json!({"cursor": c}),
             None => json!({}),
         };
-        let r = server.request(state, "tools/list", params, INIT_TIMEOUT, None).await?;
+        let r = server.request("tools/list", params, INIT_TIMEOUT, None).await?;
         tools.extend(parse_tools(&server.cfg.name, &r));
         cursor = r["nextCursor"].as_str().map(String::from);
         if cursor.is_none() || tools.len() >= MAX_TOOLS {
@@ -575,7 +618,7 @@ pub async fn call(ctx: &crate::tools::ToolCtx<'_>, call_id: &str, exposed: &str,
         let command = format!("{} › {}\n{}", server.cfg.name, tool, shown);
         crate::codetools::confirm(ctx.app, ctx.chat_id, call_id, &format!("mcp:{}", server.cfg.name), &command, "", ctx.cancel).await?;
     }
-    let r = server.request(&state, "tools/call", json!({"name": tool, "arguments": args}), CALL_TIMEOUT, Some(ctx.cancel)).await?;
+    let r = server.request("tools/call", json!({"name": tool, "arguments": args}), CALL_TIMEOUT, Some(ctx.cancel)).await?;
     let (text, is_error) = result_text(&r);
     let display = json!({"kind": "mcp", "server": server.cfg.name, "tool": tool, "ok": !is_error});
     Ok(crate::tools::ToolOutput { content: if text.is_empty() { "(no output)".into() } else { text }, display, ok: !is_error })
@@ -661,11 +704,83 @@ mod tests {
             let server = start(&state, &cfg).await.unwrap();
             assert_eq!(server.tools.len(), 1);
             assert_eq!(server.tools[0].exposed, "mcp__echo__echo");
-            let r = server.request(&state, "tools/call", json!({"name": "echo", "arguments": {"text": "hi"}}), Duration::from_secs(10), None).await.unwrap();
+            let r = server.request("tools/call", json!({"name": "echo", "arguments": {"text": "hi"}}), Duration::from_secs(10), None).await.unwrap();
             assert_eq!(result_text(&r), ("echo: hi".to_string(), false));
             server.shutdown();
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Like an MCP server behind a proxy that redirects (301) to its real address, which answers only POST
+    /// (a GET gets 405, as akulavbox does): the handshake and a call still work, and the new address is kept.
+    #[test]
+    fn http_server_behind_a_redirect() {
+        use tokio::io::AsyncReadExt;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = l.accept().await else { break };
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        // read the head, then the body by Content-Length
+                        let (head, body) = loop {
+                            let n = s.read(&mut chunk).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                                let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                                while buf.len() < i + 4 + len {
+                                    let n = s.read(&mut chunk).await.unwrap_or(0);
+                                    if n == 0 { break; }
+                                    buf.extend_from_slice(&chunk[..n]);
+                                }
+                                break (head, String::from_utf8_lossy(&buf[i + 4..]).to_string());
+                            }
+                        };
+                        let first = head.lines().next().unwrap_or("").to_string();
+                        let reply = |status: &str, extra: &str, body: &str| format!("HTTP/1.1 {status}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        let out = if first.starts_with("POST /old") {
+                            reply("301 Moved Permanently", "Location: /mcp\r\n", "")
+                        } else if first.starts_with("GET /mcp") {
+                            reply("405 Method Not Allowed", "Allow: POST\r\n", r#"{"error":"Use POST"}"#)
+                        } else if first.starts_with("POST /mcp") {
+                            let m: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                            match m["method"].as_str() {
+                                Some("initialize") => reply("200 OK", "", &json!({"jsonrpc": "2.0", "id": m["id"], "result": {"protocolVersion": PROTOCOL, "capabilities": {"tools": {}}, "serverInfo": {"name": "box", "version": "1"}}}).to_string()),
+                                Some("tools/list") => reply("200 OK", "", &json!({"jsonrpc": "2.0", "id": m["id"], "result": {"tools": [{"name": "ping", "inputSchema": {"type": "object"}}]}}).to_string()),
+                                Some("tools/call") => reply("200 OK", "", &json!({"jsonrpc": "2.0", "id": m["id"], "result": {"content": [{"type": "text", "text": "pong"}]}}).to_string()),
+                                _ => reply("202 Accepted", "", ""),
+                            }
+                        } else {
+                            reply("404 Not Found", "", "")
+                        };
+                        let _ = s.write_all(out.as_bytes()).await;
+                    });
+                }
+            });
+            let state = AppState::new().unwrap();
+            let cfg = ServerConfig { name: "box".into(), command: None, args: vec![], env: vec![], cwd: None, url: Some(format!("http://127.0.0.1:{port}/old")), headers: vec![("Authorization".into(), "Bearer t".into())], trust: false, disabled: false };
+            let server = start(&state, &cfg).await.expect("handshake through the redirect");
+            assert_eq!(server.tools.len(), 1);
+            if let Conn::Http { url, .. } = &server.conn {
+                assert_eq!(*url.lock(), format!("http://127.0.0.1:{port}/mcp"), "the redirected address is kept");
+            }
+            let r = server.request("tools/call", json!({"name": "ping", "arguments": {}}), Duration::from_secs(10), None).await.unwrap();
+            assert_eq!(result_text(&r).0, "pong");
+        });
+    }
+
+    #[test]
+    fn redirects_stay_on_the_same_host() {
+        assert_eq!(redirect_target("http://box.lan/old", "/mcp").unwrap(), "http://box.lan/mcp");
+        assert_eq!(redirect_target("http://box.lan/mcp", "https://box.lan/mcp").unwrap(), "https://box.lan/mcp");
+        assert!(redirect_target("https://box.lan/mcp", "https://evil.example/mcp").is_err(), "no token to another site");
+        assert!(redirect_target("https://box.lan/mcp", "http://box.lan/mcp").is_err(), "no downgrade to http");
     }
 
     const TEST_SERVER_JS: &str = r#"

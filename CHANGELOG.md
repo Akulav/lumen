@@ -7,6 +7,14 @@ pushed to `main`, GitHub Actions tags, builds and publishes the release.
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-21
+
+### Fixed
+- MCP servers reached by URL failed the handshake with `HTTP 405 Method Not Allowed` when the address redirects
+  (http to https, a proxy, another path): the redirect turned Lumen's POST into a GET. Lumen now follows redirects on
+  the same host itself, keeps the POST and remembers the new address; a redirect to another site or from https to
+  http is not followed, so the server's headers (a token) never go elsewhere.
+
 ## [0.16.0] - 2026-11-21
 
 ### Added
