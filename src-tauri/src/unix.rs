@@ -93,6 +93,13 @@ pub fn available_memory_mb() -> Option<u64> {
     Some((sys.available_memory() + sys.free_swap()) / (1024 * 1024))
 }
 
+/// Installed physical RAM, in MiB (what the model recommendations are sized against).
+pub fn total_memory_mb() -> Option<u64> {
+    let mut sys = system().lock().ok()?;
+    sys.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    Some(sys.total_memory() / (1024 * 1024))
+}
+
 /// Per-process GPU memory / load has no portable source on Linux and macOS: the engine panel shows 0.
 pub struct GpuMemCounter {
     pid: u32,

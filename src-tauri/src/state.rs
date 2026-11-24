@@ -87,7 +87,8 @@ pub struct Settings {
     pub ui_lang: String,
     /// Reply language: "auto" | "en" | "ro"
     pub reply_lang: String,
-    /// llama.cpp backend: "vulkan" | "rocm" | "cuda" | "cpu" (macOS: "metal" | "cpu")
+    /// llama.cpp backend: "vulkan" | "rocm" | "cuda" | "cpu" (macOS: "metal" | "cpu"). A fresh install has
+    /// "auto", which `runtime::auto_backend` replaces at the first start.
     pub backend: String,
     pub last_model: Option<String>,
     /// Context window of the model loaded last (set by the backend, kept by `set_settings`): the context
@@ -125,7 +126,7 @@ impl Default for Settings {
         Settings {
             ui_lang: "en".into(),
             reply_lang: "auto".into(),
-            backend: "vulkan".into(),
+            backend: "auto".into(),
             last_model: None,
             last_n_ctx: 0,
             ctx_size: 0,
@@ -161,8 +162,16 @@ pub struct LlmInfo {
     pub pid: u32,
     pub message: String,
     pub progress: f32,
+    /// VRAM of the discrete GPU the recommendations are sized for (0: none, or only an integrated GPU)
     pub vram_total: u64,
     pub gpu_name: String,
+    /// `gpu_name` is an integrated GPU (shares the system RAM)
+    pub gpu_integrated: bool,
+    /// The runtime was asked which GPUs exist (`runtime::detect_hardware`); until then the window waits
+    /// before recommending a model.
+    pub hw_checked: bool,
+    /// Installed RAM, bytes
+    pub ram_total: u64,
     /// Set when the model was unloaded for being idle (minutes), so the UI can say why; 0 otherwise.
     pub idle_unloaded_min: u32,
     /// When the current model became ready (ms), for the engine uptime.

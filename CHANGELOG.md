@@ -7,6 +7,23 @@ pushed to `main`, GitHub Actions tags, builds and publishes the release.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-24
+
+### Added
+- Model recommendations now fit the PC they run on. Lumen reads the installed RAM and every GPU llama.cpp sees
+  (picking the biggest dedicated card, recognising integrated graphics and software renderers) and recommends the
+  best catalog model that runs well there: the 27B models on 16–24 GB cards, Qwen3.5 9B on 8–12 GB, Qwen3.5 4B or 2B
+  on small cards and laptops, and on a PC without a GPU a model that runs on the processor (the 35B-A3B MoE with
+  32 GB of RAM or more, else 4B). Every model shows how it would run here: fits in VRAM, partial RAM offload, runs on
+  the CPU, slow, or too big. The Models page and the welcome card show the GPU, VRAM and RAM they went by.
+- New catalog models: Qwen3.5 9B Q8_0 (10–12 GB cards), Qwen3.5 4B and Qwen3.5 2B (laptops, no GPU, older PCs).
+- A fresh install picks its engine by itself: CUDA when an NVIDIA driver is present, Vulkan otherwise (Metal on macOS).
+
+### Fixed
+- A PC without a graphics card was recommended the 13 GB model meant for 16 GB cards.
+- With no GPU (or only a software renderer such as llvmpipe) llama-server no longer tries to offload to it: the
+  model runs on the CPU directly.
+
 ## [0.17.0] - 2026-11-21
 
 ### Changed

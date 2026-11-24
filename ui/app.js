@@ -589,16 +589,18 @@ function markLastTurn() {
 
 function welcome() {
   const noModels = !S.models.length;
-  const rec = S.catalog.find((c) => c.recommended);
+  const rec = recommendModel();
   const dl = rec && S.downloads["model:" + rec.file];
   const w = el(`<div class="welcome"><img src="logo.png" alt=""/><h1>${t("welcomeTitle")}</h1><p>${t("welcomeSub")}</p><div class="made-by">Lumen · ${t("madeBy")} <b>Akulav</b></div></div>`);
-  if (noModels && rec) {
+  if (noModels) {
     const card = el(`<div class="setup-card"><div class="nm" style="display:flex;gap:10px;align-items:center;font-weight:600">${icon("sparkle")}${t("setupTitle")}</div>
       <div style="color:var(--text-2)">${t("setupBody")}</div>
-      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b>${esc(rec.name)}</b><span class="tag acc">${esc(rec.tag)}</span><span class="tag">${rec.size_gb.toFixed(1)} GB</span></div>
-      <div data-dl="model:${esc(rec.file)}">${dl ? progressHtml(dl) : ""}</div>
-      <div style="display:flex;gap:8px"><button class="btn primary" id="dlRec" ${dl ? "disabled" : ""}>${icon("download")}${t("downloadRec")}</button><button class="btn" id="goModels">${t("openModels")}</button></div></div>`);
-    card.querySelector("#dlRec").onclick = () => startDownload(rec.repo, rec.file);
+      <div style="color:var(--text-2);font-size:12.5px">${hardwareLine()}</div>
+      ${rec ? `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b>${esc(rec.name)}</b><span class="tag acc">${esc(rec.tag)}</span><span class="tag">${rec.size_gb.toFixed(1)} GB</span>${fitTag(rec.size_gb, rec.moe)}</div>
+      <div style="color:var(--text-2);font-size:12.5px">${esc(S.settings.ui_lang === "ro" ? rec.desc_ro : rec.desc_en)}</div>` : ""}
+      <div data-dl="model:${esc(rec ? rec.file : "")}">${dl ? progressHtml(dl) : ""}</div>
+      <div style="display:flex;gap:8px"><button class="btn primary" id="dlRec" ${dl || !rec ? "disabled" : ""}>${icon("download")}${t("downloadRec")}</button><button class="btn" id="goModels">${t("openModels")}</button></div></div>`);
+    card.querySelector("#dlRec").onclick = () => rec && startDownload(rec.repo, rec.file);
     card.querySelector("#goModels").onclick = () => showView("models");
     w.appendChild(card);
   } else {
@@ -1090,10 +1092,46 @@ function progressHtml(p) {
   const etaS = eta ? (eta > 3600 ? (eta / 3600).toFixed(1) + " h" : eta > 60 ? Math.round(eta / 60) + " min" : Math.round(eta) + " s") : "";
   return `<div class="mini-prog"><div class="prog"><div style="width:${pct.toFixed(1)}%"></div></div><small><span>${fmtBytes(p.done)} / ${fmtBytes(p.total)} · ${pct.toFixed(0)}%</span><span>${p.speed ? fmtBytes(p.speed) + "/s" : ""} ${etaS ? "· " + etaS : ""}</span></small></div>`;
 }
-function fitTag(sizeGb) {
-  const vram = (S.info.vram_total || 0) / 1073741824;
-  if (!vram) return "";
-  return sizeGb + 1.6 < vram ? `<span class="tag ok">${t("fits")}</span>` : `<span class="tag warn">${t("partial")}</span>`;
+/** How a model of `sizeGb` GiB runs on this PC (`S.info`: discrete VRAM, installed RAM, the engine):
+ *  "gpu" fully in VRAM · "offload" partly in RAM, still fine · "cpu" on the processor at a usable speed ·
+ *  "slow" works but slowly · "big" does not fit at all · "" hardware not known yet. MoE models only run a
+ *  few billion parameters per token, so RAM (offload or CPU) hurts them far less than dense ones. */
+function modelFit(sizeGb, moe = false, info = S.info, backend = S.settings.backend) {
+  const GiB = 1073741824;
+  const vram = backend === "cpu" ? 0 : (info.vram_total || 0) / GiB;
+  const ram = (info.ram_total || 0) / GiB;
+  if (!vram && !ram) return "";
+  const need = sizeGb + 1.6; // + context and compute buffers
+  const ramRoom = ram * 0.6; // the OS, the browser and other apps keep the rest
+  if (vram && need <= vram) return "gpu";
+  if (ram && need > vram + ramRoom) return "big";
+  if (vram) return moe || sizeGb - vram < sizeGb * 0.25 ? "offload" : "slow";
+  // no discrete GPU: the processor (an integrated GPU helps the prompt, not the speed of the reply)
+  return (moe ? 3 : sizeGb) <= 4 ? "cpu" : "slow";
+}
+/** The catalog's best model (it is ordered best quality first) that runs well here; null until the
+ *  hardware is known. A GPU wants the best one that fits in VRAM; without one, the best that runs on the
+ *  CPU at a usable speed; failing both, the smallest that fits at all. */
+function recommendModel(catalog = S.catalog, info = S.info, backend = S.settings.backend) {
+  if (!info.hw_checked || !catalog.length) return null;
+  const fit = (c) => modelFit(c.size_gb, c.moe, info, backend);
+  return catalog.find((c) => fit(c) === "gpu") || catalog.find((c) => fit(c) === "cpu")
+    || catalog.find((c) => fit(c) === "offload") || [...catalog].reverse().find((c) => fit(c) !== "big") || catalog[catalog.length - 1];
+}
+/** A mixture-of-experts GGUF, from its name (Qwen3.6-35B-A3B, …-MoE-…). */
+const isMoe = (name) => /[-_.]A\d+(\.\d+)?B\b|moe/i.test(name || "");
+function fitTag(sizeGb, moe = false) {
+  const f = modelFit(sizeGb, moe);
+  const cls = { gpu: "ok", cpu: "ok", offload: "warn", slow: "warn", big: "err" }[f];
+  return f ? `<span class="tag ${cls}">${t("fit_" + f)}</span>` : "";
+}
+/** "AMD Radeon RX 9070 XT · 16 GB VRAM · 32 GB RAM", or that models run on the processor. */
+function hardwareLine() {
+  const i = S.info;
+  if (!i.hw_checked) return `<span class="spinner"></span> ${t("hwChecking")}`;
+  const ram = i.ram_total ? ` · ${fmtBytes(i.ram_total)} RAM` : "";
+  if (i.vram_total && S.settings.backend !== "cpu") return `${esc(i.gpu_name)} · ${fmtBytes(i.vram_total)} VRAM${ram}`;
+  return (i.gpu_integrated ? `${esc(i.gpu_name)} · ${t("hwIntegrated")}` : t("hwCpuOnly")) + ram;
 }
 async function refreshModels() { S.models = await call("list_models"); if (S.view === "models") renderModels(); if (S.view === "chat" && !S.messages.length) renderChat(); }
 /** Downloads a GGUF; when it finishes and nothing is loaded yet, loads it automatically. */
@@ -1121,8 +1159,8 @@ let hfState = { query: "", results: null, repo: null, files: null, loading: fals
 function renderModels() {
   const pg = $("#modelsPage");
   const inst = new Set(S.models.map((m) => m.file));
-  const gpu = S.info.gpu_name ? `${esc(S.info.gpu_name)} · ${fmtBytes(S.info.vram_total)} VRAM` : "";
-  let html = `<h2>${t("models")}</h2><p class="lead">${gpu}</p>`;
+  const rec = recommendModel();
+  let html = `<h2>${t("models")}</h2><p class="lead">${hardwareLine()}</p>`;
   html += `<h3>${icon("cube")}${t("installed")}</h3>`;
   if (!S.models.length) html += `<div class="empty" style="text-align:left;padding-left:0">${t("noInstalled")}</div>`;
   else {
@@ -1131,7 +1169,7 @@ function renderModels() {
       const active = m.active && S.info.state === "ready";
       const loading = m.active && S.info.state === "starting";
       html += `<div class="card ${active ? "active" : ""}"><div class="nm">${icon("cube")}${esc(shortModel(m.file))}</div>
-        <div class="row"><span class="tag">${fmtBytes(m.size)}</span>${fitTag(m.size / 1073741824)}${active ? `<span class="tag ok">● ${t("active")} · ${fmtK(S.info.n_ctx)} ctx</span>` : ""}${loading ? `<span class="tag warn">${t("loading")}</span>` : ""}</div>
+        <div class="row"><span class="tag">${fmtBytes(m.size)}</span>${fitTag(m.size / 1073741824, isMoe(m.file))}${active ? `<span class="tag ok">● ${t("active")} · ${fmtK(S.info.n_ctx)} ctx</span>` : ""}${loading ? `<span class="tag warn">${t("loading")}</span>` : ""}</div>
         <div class="row">${active ? `<button class="btn" data-unload>${icon("power")}${t("unload")}</button>` : `<button class="btn primary" data-load="${esc(m.file)}" ${loading ? "disabled" : ""}>${icon("play")}${t("load")}</button>`}
         <button class="btn danger ghost" data-del="${esc(m.file)}">${icon("trash")}${t("del")}</button></div></div>`;
     }
@@ -1143,8 +1181,9 @@ function renderModels() {
     const id = "model:" + c.file;
     const dl = S.downloads[id];
     const have = inst.has(c.file);
-    html += `<div class="card ${c.recommended ? "rec" : ""}"><div class="nm">${esc(c.name)}</div>
-      <div class="row"><span class="tag acc">${esc(c.tag)}</span><span class="tag">${c.size_gb.toFixed(1)} GB</span>${fitTag(c.size_gb)}</div>
+    const isRec = rec && rec.id === c.id;
+    html += `<div class="card ${isRec ? "rec" : ""}"><div class="nm">${esc(c.name)}${isRec ? ` <span class="tag acc">${icon("sparkle")}${t("forYourPc")}</span>` : ""}</div>
+      <div class="row"><span class="tag acc">${esc(c.tag)}</span><span class="tag">${c.size_gb.toFixed(1)} GB</span>${fitTag(c.size_gb, c.moe)}</div>
       <div class="ds">${esc(lang === "ro" ? c.desc_ro : c.desc_en)}</div>
       <div data-dl="${esc(id)}">${dl ? progressHtml(dl) : ""}</div>
       <div class="row">${have ? `<span class="tag ok">${icon("check")} ${t("installed")}</span>` : dl && !dl.error ? `<button class="btn" data-cancel="${esc(id)}">${icon("x")}${t("cancel")}</button>` : `<button class="btn primary" data-dlrepo="${esc(c.repo)}" data-dlpath="${esc(c.file)}">${icon("download")}${t("download")}</button>`}
@@ -1158,7 +1197,7 @@ function renderModels() {
       const name = f.path.split("/").pop();
       const id = "model:" + name;
       const dl = S.downloads[id];
-      html += `<div class="li"><span class="grow">${esc(f.path)}</span><small>${fmtBytes(f.size)}</small>${fitTag((f.size || 0) / 1073741824)}
+      html += `<div class="li"><span class="grow">${esc(f.path)}</span><small>${fmtBytes(f.size)}</small>${fitTag((f.size || 0) / 1073741824, isMoe(f.path))}
         ${inst.has(name) ? `<span class="tag ok">${t("installed")}</span>` : dl && !dl.error ? `<div style="width:220px" data-dl="${esc(id)}">${progressHtml(dl)}</div><button class="btn ghost" data-cancel="${esc(id)}">${icon("x")}</button>` : `<button class="btn" data-dlrepo="${esc(hfState.repo)}" data-dlpath="${esc(f.path)}">${icon("download")}</button>`}</div>`;
     }
     if (!hfState.files.length) html += `<div class="empty">${t("noGguf")}</div>`;
@@ -1484,7 +1523,10 @@ document.addEventListener("click", (e) => {
 // ---------------------------------------------------------------- events
 listen("server-status", (e) => {
   const prev = S.info.state;
+  const hwBefore = S.info.hw_checked;
   S.info = e.payload;
+  // the hardware check finished: the welcome card can now recommend a model for this PC
+  if (S.info.hw_checked && !hwBefore && S.view === "chat" && !S.messages.length) renderChat();
   // the backend remembers the loaded model; keep the UI copy in sync so set_settings never writes back a stale one
   if (S.info.state === "ready" && S.info.model) S.settings.last_model = S.info.model;
   // a (re)loaded model sets the context meter's scale (the chat's own cap still applies)

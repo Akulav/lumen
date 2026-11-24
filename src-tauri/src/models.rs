@@ -1,4 +1,4 @@
-//! Model management: curated catalog for 16 GB cards, local GGUF listing/deletion and Hugging Face
+//! Model management: curated catalog (no GPU up to 24 GB cards), local GGUF listing/deletion and Hugging Face
 //! search/listing/download.
 
 use anyhow::{anyhow, Result};
@@ -16,26 +16,41 @@ pub struct CatalogEntry {
     pub name: &'static str,
     pub repo: &'static str,
     pub file: &'static str,
+    /// GiB
     pub size_gb: f32,
+    /// mixture of experts: only a few billion parameters work per token, so it stays fast with part of
+    /// it (or all of it) in system RAM
+    pub moe: bool,
     pub tag: &'static str,
     pub desc_en: &'static str,
     pub desc_ro: &'static str,
-    pub recommended: bool,
 }
 
-/// Curated for a 16 GB AMD card (RX 9070 XT) + 32 GB RAM.
+/// Curated models from 4 GB cards (or no GPU at all) up to 24 GB, **best quality first**: the window
+/// recommends the first one that runs well on this PC (app.js `recommendModel`).
 pub fn catalog() -> Vec<CatalogEntry> {
     vec![
+        CatalogEntry {
+            id: "qwen38-27b-q4kxl",
+            name: "Qwen3.8 27B · Q4_K_XL",
+            repo: "unsloth/Qwen3.8-27B-GGUF",
+            file: "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+            size_gb: 16.35,
+            moe: false,
+            tag: "Max quality",
+            desc_en: "Highest quality. Fits a 20–24 GB card; on 16 GB a few layers spill into system RAM and it gets noticeably slower.",
+            desc_ro: "Cea mai bună calitate. Încape pe o placă de 20–24 GB; pe 16 GB câteva straturi trec în RAM și devine vizibil mai lent.",
+        },
         CatalogEntry {
             id: "qwen38-27b-iq4xs",
             name: "Qwen3.8 27B · IQ4_XS",
             repo: "unsloth/Qwen3.8-27B-GGUF",
             file: "Qwen3.8-27B-UD-IQ4_XS.gguf",
             size_gb: 13.27,
+            moe: false,
             tag: "Best for 16 GB",
-            desc_en: "Top quality that fits fully in the 9070 XT's VRAM. Strong reasoning, coding, English & Romanian.",
-            desc_ro: "Cea mai bună calitate care încape complet în VRAM-ul 9070 XT. Raționament, cod, engleză și română.",
-            recommended: true,
+            desc_en: "Top quality that fits fully in a 16 GB card. Strong reasoning, coding, English & Romanian.",
+            desc_ro: "Cea mai bună calitate care încape complet pe o placă de 16 GB. Raționament, cod, engleză și română.",
         },
         CatalogEntry {
             id: "qwen38-27b-q3kxl",
@@ -43,32 +58,10 @@ pub fn catalog() -> Vec<CatalogEntry> {
             repo: "unsloth/Qwen3.8-27B-GGUF",
             file: "Qwen3.8-27B-UD-Q3_K_XL.gguf",
             size_gb: 12.24,
+            moe: false,
             tag: "Long context",
             desc_en: "Slightly smaller quant – leaves more VRAM for a longer context window.",
             desc_ro: "Cuantizare puțin mai mică – lasă mai mult VRAM pentru un context mai lung.",
-            recommended: false,
-        },
-        CatalogEntry {
-            id: "qwen38-27b-q4kxl",
-            name: "Qwen3.8 27B · Q4_K_XL",
-            repo: "unsloth/Qwen3.8-27B-GGUF",
-            file: "Qwen3.8-27B-UD-Q4_K_XL.gguf",
-            size_gb: 16.35,
-            tag: "Max quality",
-            desc_en: "Higher quality; a few layers spill into system RAM, so it is noticeably slower.",
-            desc_ro: "Calitate mai mare; câteva straturi trec în RAM, deci e vizibil mai lent.",
-            recommended: false,
-        },
-        CatalogEntry {
-            id: "qwen36-35b-a3b-iq3s",
-            name: "Qwen3.6 35B-A3B MoE · IQ3_S",
-            repo: "unsloth/Qwen3.6-35B-A3B-GGUF",
-            file: "Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
-            size_gb: 12.74,
-            tag: "Fastest",
-            desc_en: "Mixture-of-experts with only 3B active parameters – very high tokens/s, fully in VRAM.",
-            desc_ro: "Mixture-of-experts cu doar 3B parametri activi – foarte rapid, complet în VRAM.",
-            recommended: false,
         },
         CatalogEntry {
             id: "qwen36-35b-a3b-q4km",
@@ -76,10 +69,32 @@ pub fn catalog() -> Vec<CatalogEntry> {
             repo: "unsloth/Qwen3.6-35B-A3B-GGUF",
             file: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
             size_gb: 20.61,
+            moe: true,
             tag: "Fast + RAM offload",
             desc_en: "Better MoE quant; some experts live in system RAM (auto-fitted). Still fast.",
             desc_ro: "Cuantizare MoE mai bună; o parte din experți stau în RAM (ajustat automat). Tot rapid.",
-            recommended: false,
+        },
+        CatalogEntry {
+            id: "qwen36-35b-a3b-iq3s",
+            name: "Qwen3.6 35B-A3B MoE · IQ3_S",
+            repo: "unsloth/Qwen3.6-35B-A3B-GGUF",
+            file: "Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+            size_gb: 12.74,
+            moe: true,
+            tag: "Fastest",
+            desc_en: "Mixture-of-experts with only 3B active parameters – very fast on a GPU, and still usable on a CPU with 32 GB of RAM.",
+            desc_ro: "Mixture-of-experts cu doar 3B parametri activi – foarte rapid pe GPU și utilizabil și pe procesor cu 32 GB RAM.",
+        },
+        CatalogEntry {
+            id: "qwen35-9b-q8",
+            name: "Qwen3.5 9B · Q8_0",
+            repo: "unsloth/Qwen3.5-9B-GGUF",
+            file: "Qwen3.5-9B-Q8_0.gguf",
+            size_gb: 8.88,
+            moe: false,
+            tag: "Best for 10–12 GB",
+            desc_en: "Near-lossless 9B. Fits a 10–12 GB card with room for a long context.",
+            desc_ro: "9B aproape fără pierderi. Încape pe o placă de 10–12 GB, cu loc pentru context lung.",
         },
         CatalogEntry {
             id: "qwen35-9b-q4km",
@@ -87,10 +102,32 @@ pub fn catalog() -> Vec<CatalogEntry> {
             repo: "unsloth/Qwen3.5-9B-GGUF",
             file: "Qwen3.5-9B-Q4_K_M.gguf",
             size_gb: 5.29,
-            tag: "Light",
-            desc_en: "Small and snappy. Huge context window, leaves room for games/other apps.",
-            desc_ro: "Mic și rapid. Context foarte mare, lasă loc pentru alte aplicații.",
-            recommended: false,
+            moe: false,
+            tag: "Best for 8 GB",
+            desc_en: "Small and snappy. Fits an 8 GB card, huge context window, leaves room for games/other apps.",
+            desc_ro: "Mic și rapid. Încape pe o placă de 8 GB, context foarte mare, lasă loc pentru alte aplicații.",
+        },
+        CatalogEntry {
+            id: "qwen35-4b-q4km",
+            name: "Qwen3.5 4B · Q4_K_M",
+            repo: "unsloth/Qwen3.5-4B-GGUF",
+            file: "Qwen3.5-4B-Q4_K_M.gguf",
+            size_gb: 2.55,
+            moe: false,
+            tag: "Laptop / no GPU",
+            desc_en: "Runs on a 4–6 GB card or on the processor alone at a usable speed. Good for everyday questions.",
+            desc_ro: "Merge pe o placă de 4–6 GB sau doar pe procesor, cu viteză utilizabilă. Bun pentru întrebări de zi cu zi.",
+        },
+        CatalogEntry {
+            id: "qwen35-2b-q4km",
+            name: "Qwen3.5 2B · Q4_K_M",
+            repo: "unsloth/Qwen3.5-2B-GGUF",
+            file: "Qwen3.5-2B-Q4_K_M.gguf",
+            size_gb: 1.19,
+            moe: false,
+            tag: "Tiny",
+            desc_en: "For older PCs (a 2–4 GB card or about 6 GB of RAM). Fast anywhere, but noticeably less capable.",
+            desc_ro: "Pentru PC-uri mai vechi (placă de 2–4 GB sau cam 6 GB RAM). Rapid oriunde, dar vizibil mai puțin capabil.",
         },
     ]
 }

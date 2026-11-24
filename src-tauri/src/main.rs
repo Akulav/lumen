@@ -254,20 +254,29 @@ fn main() {
 
             // hassle-free start: fetch the runtime and load the last model in the background
             let st = handle.state::<Arc<AppState>>().inner().clone();
-            let (autoload, last, backend) = {
-                let s = st.settings.read();
-                (s.autoload_model, s.last_model.clone(), s.backend.clone())
-            };
+            st.info.write().ram_total = platform::total_memory_mb().unwrap_or(0) * 1024 * 1024;
             let h2 = handle.clone();
             tauri::async_runtime::spawn(async move {
-                if let Ok(exe) = runtime::ensure(&h2, &backend, false).await {
-                    if let Some((name, total)) = runtime::detect_gpu(&exe).await {
-                        let mut i = st.info.write();
-                        i.gpu_name = name;
-                        i.vram_total = total;
-                    }
-                    server::emit_status(&h2);
+                // a fresh install picks its engine from the hardware (CUDA for NVIDIA, else Vulkan)
+                if st.settings.read().backend == "auto" {
+                    let picked = runtime::auto_backend().await;
+                    st.log(format!("[lumen] first start: llama.cpp backend '{picked}'"));
+                    st.settings.write().backend = picked;
+                    st.save_settings();
                 }
+                let (autoload, last, backend) = {
+                    let s = st.settings.read();
+                    (s.autoload_model, s.last_model.clone(), s.backend.clone())
+                };
+                // (offline, or the runtime can't say: recommend from the RAM alone rather than wait forever)
+                let listed = match runtime::ensure(&h2, &backend, false).await {
+                    Ok(exe) => runtime::detect_hardware(&st, &exe).await,
+                    Err(_) => false,
+                };
+                if !listed {
+                    st.info.write().hw_checked = true;
+                }
+                server::emit_status(&h2);
                 if autoload {
                     if let Some(m) = last.filter(|m| st.paths.models.join(m).exists()) {
                         let _ = server::start_llm(&h2, &m).await;

@@ -283,13 +283,13 @@ pub async fn start_llm(app: &AppHandle, model_file: &str) -> Result<()> {
             return Err(e);
         }
     };
-    if state.info.read().vram_total == 0 {
-        if let Some((name, total)) = crate::runtime::detect_gpu(&exe).await {
-            let mut i = state.info.write();
-            i.gpu_name = name;
-            i.vram_total = total;
-        }
-    }
+    let listed = if state.info.read().vram_total == 0 { crate::runtime::detect_hardware(&state, &exe).await } else { true };
+    // the runtime saw no GPU, or only a software one (llvmpipe…): offloading to that would be far slower
+    // than the CPU itself
+    let cpu_only = settings.backend == "cpu" || {
+        let i = state.info.read();
+        listed && i.vram_total == 0 && !i.gpu_integrated && !cfg!(target_os = "macos")
+    };
 
     let port = free_port();
     let mut args: Vec<String> = vec![
@@ -333,7 +333,7 @@ pub async fn start_llm(app: &AppHandle, model_file: &str) -> Result<()> {
         args.push("--n-cpu-moe".into());
         args.push(settings.n_cpu_moe.to_string());
     }
-    if settings.backend == "cpu" {
+    if cpu_only {
         args.push("--gpu-layers".into());
         args.push("0".into());
     }

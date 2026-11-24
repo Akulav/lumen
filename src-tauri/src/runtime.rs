@@ -21,6 +21,9 @@ const SERVER: &str = if cfg!(windows) { "llama-server.exe" } else { "llama-serve
 pub fn effective_backend(backend: &str) -> String {
     if cfg!(target_os = "macos") && backend != "cpu" {
         "metal".into()
+    } else if backend == "auto" {
+        // (only until the first start has resolved it: `auto_backend`)
+        "vulkan".into()
     } else {
         backend.to_string()
     }
@@ -315,8 +318,69 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()>
     Ok(())
 }
 
-/// Parse `llama-server --list-devices` -> (gpu name, total VRAM bytes)
-pub async fn detect_gpu(exe: &std::path::Path) -> Option<(String, u64)> {
+/// The backend a fresh install starts with ("auto" in the settings): Metal on macOS, CUDA when an NVIDIA
+/// driver new enough for CUDA 12 answers, Vulkan otherwise (AMD, Intel, and no GPU – the Vulkan build falls
+/// back to the CPU by itself).
+pub async fn auto_backend() -> String {
+    if cfg!(target_os = "macos") {
+        return "metal".into();
+    }
+    match nvidia_smi(&[]).await.as_deref().and_then(|s| parse_nvidia_smi(s, "")) {
+        Some((driver, _)) if driver >= 12 => "cuda".into(),
+        _ => "vulkan".into(),
+    }
+}
+
+/// What kind of device `llama-server --list-devices` reported, from its name: "software" (a CPU pretending
+/// to be a GPU: much slower than the CPU backend), "integrated" (shares system RAM; the MiB it reports are
+/// not VRAM) or "discrete".
+pub fn device_kind(name: &str) -> &'static str {
+    let n = name.to_lowercase();
+    if ["llvmpipe", "swiftshader", "softpipe", "lavapipe", "basic render", "microsoft basic"].iter().any(|s| n.contains(s)) {
+        return "software";
+    }
+    let discrete_hint = regex::Regex::new(r"\b(rtx|gtx|quadro|tesla|rx\s?\d|arc\s?(\(tm\)\s?)?[ab]\d{3}|radeon\s?(\(tm\)\s?)?(pro|vii|r9|hd)|instinct|apple)").unwrap();
+    if discrete_hint.is_match(&n) {
+        return "discrete";
+    }
+    // Intel UHD / Iris / "Intel(R) Graphics" / Meteor Lake "Arc(TM) Graphics", AMD APUs ("Radeon(TM)
+    // Graphics", 680M…8060S), Qualcomm Adreno
+    let integrated = regex::Regex::new(r"(intel.*(uhd|iris|hd graphics|\(r\) graphics|arc\(tm\) graphics|arc(\(tm\))?\s?\d{3}[vth]\b))|radeon(\(tm\))?\s*(\d{3,4}[ms]\s*)?graphics|radeon\s?\d{3,4}[ms]\b|adreno|vega \d+ graphics").unwrap();
+    if integrated.is_match(&n) {
+        return "integrated";
+    }
+    "discrete"
+}
+
+/// One device of `llama-server --list-devices`: name, total memory (bytes) and `device_kind`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Device {
+    pub name: String,
+    pub total: u64,
+    pub kind: &'static str,
+}
+
+/// Every line `  Vulkan0: AMD Radeon RX 9070 XT (16304 MiB, 15890 MiB free)` of `--list-devices`.
+pub fn parse_devices(text: &str) -> Vec<Device> {
+    let re = regex::Regex::new(r"(?m)^\s*\w+\d+:\s*(.+?)\s*\((\d+)\s*MiB").unwrap();
+    re.captures_iter(text)
+        .filter_map(|c| {
+            let name = c[1].to_string();
+            Some(Device { kind: device_kind(&name), total: c[2].parse::<u64>().ok()? * 1024 * 1024, name })
+        })
+        .collect()
+}
+
+/// The device the recommendations are sized for: the discrete GPU with the most memory, else an integrated
+/// one (its memory counted as 0 VRAM: it shares the RAM), else none. Software devices never count.
+pub fn best_device(devices: &[Device]) -> Option<Device> {
+    let discrete = devices.iter().filter(|d| d.kind == "discrete").max_by_key(|d| d.total);
+    discrete.or_else(|| devices.iter().find(|d| d.kind == "integrated")).cloned()
+}
+
+/// Asks the runtime which GPUs it sees and stores the result (GPU name, VRAM, integrated or not, and that
+/// the check happened) in the status the window shows. False if the runtime could not be asked.
+pub async fn detect_hardware(state: &AppState, exe: &std::path::Path) -> bool {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("--list-devices");
     crate::platform::quiet(&mut cmd);
@@ -324,11 +388,25 @@ pub async fn detect_gpu(exe: &std::path::Path) -> Option<(String, u64)> {
     if let Some(dir) = exe.parent() {
         cmd.env("LD_LIBRARY_PATH", dir);
     }
-    let out = cmd.output().await.ok()?;
+    let Ok(out) = cmd.output().await else { return false };
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    let re = regex::Regex::new(r"(?m)^\s*\w+\d+:\s*(.+?)\s*\((\d+)\s*MiB").ok()?;
-    let c = re.captures(&text)?;
-    Some((c[1].to_string(), c[2].parse::<u64>().ok()? * 1024 * 1024))
+    if !text.contains("Available devices") {
+        state.log(format!("[runtime] --list-devices gave no device list: {}", text.trim()));
+        return false;
+    }
+    let devices = parse_devices(&text);
+    let best = best_device(&devices);
+    state.log(format!(
+        "[runtime] devices: {} -> {}",
+        if devices.is_empty() { "none".to_string() } else { devices.iter().map(|d| format!("{} ({} MiB, {})", d.name, d.total >> 20, d.kind)).collect::<Vec<_>>().join(", ") },
+        best.as_ref().map(|d| d.name.as_str()).unwrap_or("CPU only")
+    ));
+    let mut i = state.info.write();
+    i.hw_checked = true;
+    i.gpu_integrated = best.as_ref().is_some_and(|d| d.kind == "integrated");
+    i.gpu_name = best.as_ref().map(|d| d.name.clone()).unwrap_or_default();
+    i.vram_total = best.filter(|d| d.kind == "discrete").map(|d| d.total).unwrap_or(0);
+    true
 }
 
 #[cfg(test)]
@@ -476,6 +554,44 @@ mod tests {
         println!("{text}");
         assert!(out.status.success() && text.contains("version"), "llama-server starts");
         let _ = std::fs::remove_dir_all(&staging);
+    }
+
+    /// The GPU the recommendations are sized for: discrete cards win, integrated GPUs share the RAM (0 VRAM),
+    /// software renderers and "(none)" mean the CPU.
+    #[test]
+    fn picks_the_gpu_that_matters() {
+        let out = "ggml_vulkan: Found 2 Vulkan devices:\nAvailable devices:\n  Vulkan0: Intel(R) UHD Graphics 770 (16245 MiB, 16000 MiB free)\n  Vulkan1: AMD Radeon RX 9070 XT (16304 MiB, 15890 MiB free)\n";
+        let d = parse_devices(out);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].kind, "integrated");
+        let best = best_device(&d).unwrap();
+        assert_eq!((best.name.as_str(), best.total >> 20, best.kind), ("AMD Radeon RX 9070 XT", 16304, "discrete"));
+        assert!(best_device(&parse_devices("Available devices:\n  (none)\n")).is_none());
+        assert!(best_device(&parse_devices("Available devices:\n  Vulkan0: llvmpipe (LLVM 19.1.1, 256 bits) (32000 MiB, 32000 MiB free)\n")).is_none());
+        let igpu = best_device(&parse_devices("Available devices:\n  Vulkan0: AMD Radeon(TM) 780M Graphics (8192 MiB, 8000 MiB free)\n")).unwrap();
+        assert_eq!(igpu.kind, "integrated");
+        let two = parse_devices("Available devices:\n  CUDA0: NVIDIA GeForce RTX 3060 (12288 MiB, 11000 MiB free)\n  CUDA1: NVIDIA GeForce RTX 4090 (24564 MiB, 23000 MiB free)\n");
+        assert_eq!(best_device(&two).unwrap().name, "NVIDIA GeForce RTX 4090", "the biggest card");
+        // the RAM the recommendations are sized against is read for real
+        assert!(crate::platform::total_memory_mb().unwrap_or(0) > 1024);
+        for (name, kind) in [
+            ("NVIDIA GeForce GTX 1650", "discrete"),
+            ("NVIDIA GeForce MX450", "discrete"),
+            ("Intel(R) Arc(TM) A770 Graphics", "discrete"),
+            ("Intel(R) Arc(TM) B580 Graphics", "discrete"),
+            ("Intel(R) Arc(TM) Graphics", "integrated"),
+            ("Intel(R) Arc(TM) 140V GPU (16GB)", "integrated"),
+            ("Intel(R) Iris(R) Xe Graphics", "integrated"),
+            ("Intel(R) Graphics", "integrated"),
+            ("AMD Radeon(TM) Graphics", "integrated"),
+            ("AMD Radeon 8060S Graphics", "integrated"),
+            ("AMD Radeon RX 7600", "discrete"),
+            ("AMD Radeon PRO W7900", "discrete"),
+            ("Apple M2 Pro", "discrete"),
+            ("Microsoft Basic Render Driver", "software"),
+        ] {
+            assert_eq!(device_kind(name), kind, "{name}");
+        }
     }
 
     #[test]

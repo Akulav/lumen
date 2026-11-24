@@ -359,6 +359,7 @@ a.chip:hover { border-color: var(--accent); color: var(--text); }
 .tag { font-size: 11px; padding: 2px 8px; border-radius: 20px; background: var(--panel-3); color: var(--text-2); border: 1px solid var(--line); white-space: nowrap; }
 .tag.ok { color: var(--ok); border-color: rgba(108, 203, 95, 0.35); background: rgba(108, 203, 95, 0.08); }
 .tag.warn { color: var(--warn); border-color: rgba(252, 225, 0, 0.35); background: rgba(252, 225, 0, 0.08); }
+.tag.err { color: var(--bad); border-color: rgba(255, 153, 164, 0.4); background: rgba(255, 153, 164, 0.08); }
 .tag.acc { color: #99ebff; border-color: rgba(96, 205, 255, 0.45); background: var(--accent-soft); }
 .btn { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line-2); background: var(--panel-2); color: var(--text); padding: 7px 13px; border-radius: 4px; font-size: 13px; font-weight: 500; transition: 0.15s; white-space: nowrap; }
 .btn:hover { background: var(--panel-3); }

@@ -85,6 +85,14 @@ pub fn available_memory_mb() -> Option<u64> {
     Some(m.ullAvailPageFile / (1024 * 1024))
 }
 
+/// Installed physical RAM, in MiB (what the model recommendations are sized against).
+pub fn total_memory_mb() -> Option<u64> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    unsafe { GlobalMemoryStatusEx(&mut m) }.ok()?;
+    Some(m.ullTotalPhys / (1024 * 1024))
+}
+
 /// The app icon, embedded so the window can get crisp big and small icons at any DPI.
 const APP_ICO: &[u8] = include_bytes!("../icons/icon.ico");
 
