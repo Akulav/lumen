@@ -7,6 +7,30 @@ pushed to `main`, GitHub Actions tags, builds and publishes the release.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-24
+
+### Added
+- **Work in a folder**: drop a folder on the window and the chat works in it. Lumen opens (or creates) the folder's
+  project, so the model can list, search, read and edit the files there; every change can still be undone.
+- **Attach files**: drop files on the window, pick them with the new paperclip button, or paste a screenshot. Text,
+  code, PDF and Word files go with the message (very long ones are cut, and the chip shows it); attachments are kept
+  when you regenerate or edit the message.
+- **Images**: models can now read images. On the Models page, "Add image support" downloads a model's vision part
+  (about 0.6–0.9 GB, from the same Hugging Face repo); attached or pasted images then go to the model. Every model in
+  the catalog has one. When VRAM is tight the vision part stays in RAM.
+- **Assistants**: saved roles with their own instructions and temperature (Settings → Assistants), picked per chat
+  with the Assistant button under the message box. Three starters: Translator, Writing editor, Code reviewer.
+- **Local API**: an optional OpenAI-compatible server (Settings → Local API, off by default) so editor plugins, scripts
+  and other apps can use the loaded model at `http://127.0.0.1:1235/v1`. Optional key; network access only with a key.
+  It loads the last model if none is loaded.
+- **Math and diagrams**: LaTeX in replies (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`) is typeset with KaTeX, and ```` ```mermaid ````
+  blocks are drawn as diagrams (the code is one click away).
+- **Read aloud**: a speaker button on every reply reads it with the system's voices (a Romanian voice for Romanian text
+  when one is installed); press again to stop.
+
+### Changed
+- Settings tabs wrap onto a second line instead of scrolling out of sight.
+
 ## [0.18.0] - 2026-11-24
 
 ### Added

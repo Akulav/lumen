@@ -35,6 +35,21 @@ pub fn custom_instructions(text: &str) -> String {
     format!("\n\n# Custom instructions from the user\nFollow these unless a request explicitly overrides them.\n{text}")
 }
 
+/// The role of a saved assistant the user picked for this chat (Settings → Assistants).
+pub fn assistant(name: &str, instructions: &str) -> String {
+    let text = instructions.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    format!("\n\n# Your role in this chat: {}\nThe user set this chat up with these standing instructions; they take priority over the general style above.\n{text}", name.trim())
+}
+
+/// Told with every message that carries files: how attachments reach the model.
+pub const ATTACHMENTS: &str = r#"
+
+# Attachments
+Files the user attaches appear inside their message as <attached_file name="…"> blocks (the whole text, or the start of it when the file is very long). Images the user attaches come with the message itself. Refer to attachments by their file name."#;
+
 pub const GENERAL_TOOLS: &str = r#"
 
 # Tools

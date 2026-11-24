@@ -42,9 +42,14 @@ pub fn set_settings(app: AppHandle, state: S, mut settings: Settings) -> R<()> {
         let mut cur = state.settings.write();
         settings.last_n_ctx = cur.last_n_ctx; // the backend's to set; the window's copy may be older
         let changed = cur.mcp_config != settings.mcp_config;
+        let api_changed = (cur.api_enabled, cur.api_port, &cur.api_key, cur.api_lan) != (settings.api_enabled, settings.api_port, &settings.api_key, settings.api_lan);
         *cur = settings;
-        changed
+        (changed, api_changed)
     };
+    let (mcp_changed, api_changed) = mcp_changed;
+    if api_changed {
+        crate::api::restart(&app);
+    }
     if mcp_changed {
         // the servers restart with the new configuration
         state.mcp.reset();
@@ -143,9 +148,23 @@ pub fn list_chats(state: S, project_id: Option<String>) -> R<Value> {
 }
 
 #[tauri::command]
-pub fn create_chat(state: S, project_id: Option<String>) -> R<Value> {
+pub fn create_chat(state: S, project_id: Option<String>, assistant_id: Option<String>) -> R<Value> {
     let title = default_title(&state.settings.read().ui_lang);
-    state.db.create_chat(project_id.as_deref(), title).map(|c| json!(c)).map_err(e)
+    let mut c = state.db.create_chat(project_id.as_deref(), title).map_err(e)?;
+    if assistant_id.is_some() {
+        state.db.set_chat_assistant(&c.id, assistant_id.as_deref()).map_err(e)?;
+        c.assistant_id = assistant_id;
+    }
+    Ok(json!(c))
+}
+
+/// Picks the saved assistant a chat talks to (None: the default). Applies from the next message.
+#[tauri::command]
+pub fn set_chat_assistant(state: S, id: String, assistant_id: Option<String>) -> R<()> {
+    if state.generations.lock().contains_key(&id) {
+        return Err("Wait until the reply is finished, then change the assistant.".into());
+    }
+    state.db.set_chat_assistant(&id, assistant_id.as_deref()).map_err(e)
 }
 
 /// Ids of chats whose messages contain `query` (the sidebar search also matches titles itself).
@@ -250,9 +269,10 @@ pub fn delete_exchange(state: S, chat_id: String, message_id: String) -> R<u32> 
 }
 
 #[tauri::command]
-pub fn send_message(app: AppHandle, chat_id: String, text: String, think: bool, web: bool, research: bool) {
+pub fn send_message(app: AppHandle, chat_id: String, text: String, think: bool, web: bool, research: bool, attachments: Option<Vec<chat::Attachment>>) {
     tauri::async_runtime::spawn(async move {
-        let _ = chat::send(app, SendOpts { chat_id, text, think, web, research }).await;
+        let attachments = attachments.unwrap_or_default();
+        let _ = chat::send(app, SendOpts { chat_id, text, think, web, research, attachments, keep: None }).await;
     });
 }
 
@@ -278,9 +298,11 @@ pub fn edit_and_resend(app: AppHandle, state: S, chat_id: String, message_id: St
     let msgs = state.db.messages(&chat_id).map_err(e)?;
     let m = msgs.iter().find(|m| m.id == message_id).ok_or("message not found")?;
     let research = m.meta["research"].as_bool().unwrap_or(false);
+    // (the edited message keeps its attachments)
+    let keep = Some(m.meta.clone());
     state.db.truncate_from(&chat_id, m.seq).map_err(e)?;
     tauri::async_runtime::spawn(async move {
-        let _ = chat::send(app, SendOpts { chat_id, text, think, web, research }).await;
+        let _ = chat::send(app, SendOpts { chat_id, text, think, web, research, attachments: vec![], keep }).await;
     });
     Ok(())
 }
@@ -365,6 +387,73 @@ pub fn reindex_project(app: AppHandle, id: String) {
     tauri::async_runtime::spawn(async move {
         let _ = rag::index_project(&app, &id).await;
     });
+}
+
+/// What was dropped on the window: each path with whether it is a folder, its name and size.
+#[tauri::command]
+pub fn inspect_paths(paths: Vec<String>) -> Value {
+    json!(paths
+        .iter()
+        .map(|p| {
+            let path = std::path::Path::new(p);
+            let md = std::fs::metadata(path).ok();
+            json!({
+                "path": p,
+                "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone()),
+                "dir": md.as_ref().is_some_and(|m| m.is_dir()),
+                "size": md.as_ref().map(|m| m.len()).unwrap_or(0),
+                "exists": md.is_some(),
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+/// "Work in this folder": the project for `folder` – the existing one, or a new one named after the
+/// folder (indexed in the background). Like a project made in the Projects tab: the model's file tools
+/// stay inside the folder and every change can be undone.
+#[tauri::command]
+pub fn open_folder(app: AppHandle, state: S, folder: String) -> R<Value> {
+    let path = std::path::Path::new(&folder);
+    if !path.is_dir() {
+        return Err("that is not a folder".into());
+    }
+    let same = |a: &str| {
+        let norm = |s: &str| s.trim_end_matches(['/', '\\']).replace('\\', "/");
+        if cfg!(windows) { norm(a).eq_ignore_ascii_case(&norm(&folder)) } else { norm(a) == norm(&folder) }
+    };
+    if let Some(p) = state.db.projects().map_err(e)?.into_iter().find(|p| same(&p.folder)) {
+        return Ok(json!({"project": p, "created": false}));
+    }
+    let p = create_project(app, state, String::new(), folder)?;
+    Ok(json!({"project": p, "created": true}))
+}
+
+/// The composer's attach button: files to send with the next message (paths; None if cancelled).
+#[tauri::command]
+pub async fn pick_files(app: AppHandle) -> Option<Vec<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_files(move |f| {
+        let _ = tx.send(f.map(|v| v.into_iter().filter_map(|p| p.into_path().ok()).map(|p| p.to_string_lossy().into_owned()).collect()));
+    });
+    rx.await.ok().flatten()
+}
+
+/// An image attached to a message, as a `data:` URL for the window to show.
+#[tauri::command]
+pub fn attachment_data(state: S, file: String) -> Option<String> {
+    chat::image_data_url(&state, &file)
+}
+
+/// Downloads the vision projector of an installed model so it can read images (reload to use it).
+#[tauri::command]
+pub async fn add_vision(app: AppHandle, file: String) -> R<String> {
+    models::add_vision(&app, &file).await.map_err(e)
+}
+
+/// The local API server's state for Settings ("" when off).
+#[tauri::command]
+pub fn api_status(state: S) -> String {
+    state.api_status.read().clone()
 }
 
 // ---------------- misc ----------------

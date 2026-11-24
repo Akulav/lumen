@@ -25,6 +25,8 @@ pub struct Paths {
     pub embed_models: PathBuf,
     pub data: PathBuf,
     pub backups: PathBuf,
+    /// Copies of images attached to chat messages (data/attachments)
+    pub attachments: PathBuf,
 }
 
 impl Paths {
@@ -50,9 +52,10 @@ impl Paths {
             embed_models: root.join("models").join("embedding"),
             data: root.join("data"),
             backups: root.join("data").join("backups"),
+            attachments: root.join("data").join("attachments"),
             root,
         };
-        for d in [&p.runtime, &p.models, &p.embed_models, &p.data, &p.backups] {
+        for d in [&p.runtime, &p.models, &p.embed_models, &p.data, &p.backups, &p.attachments] {
             let _ = std::fs::create_dir_all(d);
         }
         p
@@ -119,6 +122,51 @@ pub struct Settings {
     pub custom_instructions: String,
     /// MCP servers whose tools the model may use, as `{"mcpServers": {...}}` JSON (mcp.rs). Empty = none.
     pub mcp_config: String,
+    /// Saved assistants: a name, standing instructions and an optional temperature, picked per chat.
+    /// Settings files from before 0.19 get the starter set.
+    #[serde(default = "default_assistants")]
+    pub assistants: Vec<Assistant>,
+    /// Local OpenAI-compatible server (api.rs) for other programs: off by default.
+    pub api_enabled: bool,
+    pub api_port: u16,
+    /// Required as `Authorization: Bearer <key>` when not empty (always required with `api_lan`).
+    pub api_key: String,
+    /// Listen on every network interface instead of only this PC (needs `api_key`).
+    pub api_lan: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Assistant {
+    pub id: String,
+    pub name: String,
+    pub instructions: String,
+    /// None = the temperature from Settings → Chat
+    pub temperature: Option<f32>,
+}
+
+pub fn default_assistants() -> Vec<Assistant> {
+    let a = |id: &str, name: &str, instructions: &str, temperature: Option<f32>| Assistant { id: id.into(), name: name.into(), instructions: instructions.into(), temperature };
+    vec![
+        a(
+            "translator",
+            "Translator",
+            "You are a translator. Translate everything the user writes: Romanian to English, any other language to Romanian, unless the user names a target language. Keep the meaning, tone and formatting; reply with the translation only, plus a short note when a phrase has no direct equivalent.",
+            Some(0.3),
+        ),
+        a(
+            "editor",
+            "Writing editor",
+            "You are a careful editor. Improve the clarity, grammar and flow of the text the user gives you while keeping their voice and meaning. Return the edited text first, then a short list of the most important changes.",
+            Some(0.4),
+        ),
+        a(
+            "coder",
+            "Code reviewer",
+            "You are a senior software engineer reviewing code. Look for bugs, edge cases, security problems and unclear code, most serious first. Be specific: quote the line, explain the problem, show the fix. Skip praise and style nitpicks unless asked.",
+            Some(0.2),
+        ),
+    ]
 }
 
 impl Default for Settings {
@@ -146,6 +194,11 @@ impl Default for Settings {
             searxng_url: String::new(),
             custom_instructions: String::new(),
             mcp_config: String::new(),
+            assistants: default_assistants(),
+            api_enabled: false,
+            api_port: 1235,
+            api_key: String::new(),
+            api_lan: false,
         }
     }
 }
@@ -172,6 +225,8 @@ pub struct LlmInfo {
     pub hw_checked: bool,
     /// Installed RAM, bytes
     pub ram_total: u64,
+    /// The loaded model reads images (it was started with its vision projector, `--mmproj`)
+    pub vision: bool,
     /// Set when the model was unloaded for being idle (minutes), so the UI can say why; 0 otherwise.
     pub idle_unloaded_min: u32,
     /// When the current model became ready (ms), for the engine uptime.
@@ -229,6 +284,9 @@ pub struct AppState {
     pub allowed_tools: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// Connected MCP servers and their tools.
     pub mcp: crate::mcp::Mcp,
+    /// The local API server (api.rs): its task and what the window shows about it.
+    pub api: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    pub api_status: RwLock<String>,
 }
 
 impl AppState {
@@ -271,6 +329,8 @@ impl AppState {
             approvals: Mutex::new(HashMap::new()),
             allowed_tools: Mutex::new(HashMap::new()),
             mcp: Default::default(),
+            api: Mutex::new(None),
+            api_status: RwLock::new(String::new()),
         })
     }
 

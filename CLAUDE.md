@@ -106,18 +106,20 @@ The owner wants every change to ship as a release. For **every** change set (fea
 ```
 run.bat, scripts/build.ps1   one-click Windows build (toolchain auto-install, Inno Setup)
 scripts/bump-version.ps1     version bump; release.ps1 pre-release checks + push; release-notes.ps1 CHANGELOG section
-scripts/installer-images.ps1 setup wizard pictures; scripts/vendor.js re-copies UI libs into ui/vendor
+scripts/installer-images.ps1 setup wizard pictures; scripts/vendor.js re-copies UI libs into ui/vendor (marked, DOMPurify,
+                             highlight.js, KaTeX + fonts, Mermaid – loaded on the first diagram)
 .github/workflows/           ci.yml (3-OS checks), release.yml (tests → 3 builds → tag + release)
 ui/                          index.html, styles.css, app.js (all UI logic), i18n.js (EN/RO strings), vendor/
 src-tauri/installer/         lumen.iss, Romanian.isl, wizard-*.bmp (Windows setup); Info.plist (macOS app)
 src-tauri/src/
   main.rs       app setup, tray (+ update entries), close-to-tray, macOS reopen, shutdown of child processes
   commands.rs   every #[tauri::command] the UI calls (thin wrappers)
+  api.rs        optional local OpenAI-compatible API (Settings → Local API): HTTP/1.1 proxy to llama-server
   state.rs      AppState, Settings (serde-default JSON in LumenData/data/settings.json), Paths, logs
   db.rs         SQLite schema + queries (projects, chats, messages, chunks, files, stats)
   server.rs     spawns llama-server (chat) and the CPU embedding server; health/props; --fit; prompt-cache cap
   runtime.rs    downloads the llama.cpp build for this OS/backend from GitHub; GPU detection
-  models.rs     curated catalog for 16 GB cards, local list/delete, HF download/search
+  models.rs     curated catalog (no GPU … 24 GB, best first), local list/delete, HF download/search, vision projectors
   download.rs   resumable downloader with progress events
   mcp.rs        MCP client: mcpServers JSON (settings.mcp_config), stdio + Streamable HTTP, tools as mcp__<server>__<tool>
   llm.rs        SSE streaming client for /v1/chat/completions; readable server errors (bad allocation)
@@ -152,6 +154,17 @@ tool_progress (audit_code batches), assistant_done, assistant_failed, compress_p
   llama-server skips a bigger state instead of allocating it. Don't remove the cap.
 - Prompt-cache friendliness: keep the system prompt and old messages byte-stable; per-message RAG context is stored in
   `meta.prompt_content` and re-sent identically.
+- Hardware-aware recommendations: `runtime::detect_hardware` (devices from `--list-devices`: discrete / integrated /
+  software) + installed RAM fill `LlmInfo`; app.js `modelFit` / `recommendModel` pick from the catalog (keep it ordered
+  best quality first). A fresh install has `backend: "auto"`, resolved at the first start by `runtime::auto_backend`.
+- Vision: a model's projector is `models/<stem>.mmproj.gguf` (`models::add_vision`); `start_llm` adds `--mmproj` (and
+  `--no-mmproj-offload` when VRAM is tight) and sets `info.vision`. llama-server turns `--cache-reuse` off for it.
+- Attachments (`chat::take_attachments`): images copied to `data/attachments` (`meta.images`, sent as `image_url` data
+  URLs by `build_messages`), file text in `meta.attached` (part of `prompt_content`). Regenerate/edit carry them over
+  (`SendOpts.keep`). Dropping a folder (`tauri://drag-drop`) opens its project (`open_folder`) as the chat's workspace.
+- Assistants: `settings.assistants` (role + optional temperature), `chats.assistant_id`; `chat::system_prompt` and
+  `gen_params_for` apply them.
+- Local API (`api.rs`): off by default, 127.0.0.1 only unless `api_lan` (which needs `api_key`); no CORS headers.
 - Tool file access goes through `tools::resolve` (keeps paths inside the project folder) and `backup()` before writing.
 - llama-servers require `state.api_key` (`--api-key`): talk to them with `state.local` (sends the key), never `state.http`.
 - Downloads: pass the expected SHA-256 to `download::download` (GitHub `digest` for llama.cpp, HF LFS oid for models).

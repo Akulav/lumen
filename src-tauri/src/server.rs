@@ -149,6 +149,7 @@ pub async fn stop_llm(app: &AppHandle) {
     set_status(app, |i| {
         i.state = "stopped".into();
         i.model = None;
+        i.vision = false;
         i.n_ctx = 0;
         i.pid = 0;
         i.port = 0;
@@ -333,6 +334,19 @@ pub async fn start_llm(app: &AppHandle, model_file: &str) -> Result<()> {
         args.push("--n-cpu-moe".into());
         args.push(settings.n_cpu_moe.to_string());
     }
+    // images: the model's vision projector (models.rs `add_vision`); when model + projector would not fit
+    // the card together, the projector stays in RAM (image reading gets slower, the reply doesn't)
+    let projector = crate::models::projector_path(&state, model_file);
+    let vision = projector.exists();
+    if vision {
+        args.push("--mmproj".into());
+        args.push(projector.to_string_lossy().into());
+        let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let vram = state.info.read().vram_total;
+        if cpu_only || size(&model_path) + size(&projector) + (1600 << 20) > vram {
+            args.push("--no-mmproj-offload".into());
+        }
+    }
     if cpu_only {
         args.push("--gpu-layers".into());
         args.push("0".into());
@@ -376,6 +390,7 @@ pub async fn start_llm(app: &AppHandle, model_file: &str) -> Result<()> {
         i.state = "ready".into();
         i.port = port;
         i.n_ctx = n_ctx;
+        i.vision = vision;
         i.message = String::new();
         i.crash.clear();
         i.loaded_at = crate::state::now_ms();

@@ -22,6 +22,11 @@ const fmtK = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : 
 const estTokens = (s) => Math.ceil((s || "").length / 3.6);
 
 const ICONS = {
+  clip: '<path d="m21 11.5-8.6 8.6a5.5 5.5 0 0 1-7.8-7.8l8.6-8.6a3.7 3.7 0 0 1 5.2 5.2l-8.6 8.6a1.8 1.8 0 0 1-2.6-2.6l7.9-7.9"/>',
+  image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-9 9"/>',
+  speaker: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+  server: '<rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/>',
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
@@ -82,6 +87,9 @@ const S = {
   lastPromptTps: 0, engineOpen: false,
   confirms: {}, // tool_confirm requests still waiting for the user's answer, by id
   mcp: { error: "", servers: [] }, // MCP servers from Settings and their state (mcp.rs)
+  attach: [], // files / images for the next message: {name, path?, data?, size, image}
+  pendingAssistant: null, // assistant picked before the first message creates the chat
+  apiStatus: "", // the local API server's address, or "error: …" (api.rs)
 };
 /** Translate key `k` in the current UI language (falls back to English), filling {placeholders}. */
 const t = (k, vars) => {
@@ -164,6 +172,8 @@ function closeMenu() { openMenuEl?.remove(); openMenuEl = null; document.removeE
 const mdRenderer = new marked.Renderer();
 mdRenderer.code = function ({ text, lang }) {
   const l = (lang || "").split(/\s/)[0];
+  // a diagram: shown as code until the reply is finished, then drawn by renderDiagrams()
+  if (l === "mermaid") return `<div class="diagram" data-src="${esc(encodeURIComponent(text))}"><pre><code>${esc(text)}</code></pre></div>`;
   let html;
   try { html = l && hljs.getLanguage(l) ? hljs.highlight(text, { language: l }).value : hljs.highlightAuto(text).value; } catch { html = esc(text); }
   return `<div class="code"><div class="code-h"><span>${esc(l || "code")}</span><button class="copy-code">${icon("copy")}${t("copy")}</button></div><pre><code class="hljs">${html}</code></pre></div>`;
@@ -171,12 +181,62 @@ mdRenderer.code = function ({ text, lang }) {
 marked.setOptions({ gfm: true, breaks: false, renderer: mdRenderer });
 /** Markdown → sanitized HTML. With research `sources`, [n] markers become clickable citation chips. */
 function renderMd(text, sources) {
-  let html = marked.parse(text || "");
+  const { text: src, math } = stashMath(text || "");
+  let html = marked.parse(src);
   if (sources && sources.length) {
     const byN = Object.fromEntries(sources.map((s) => [String(s.n), s]));
     html = html.replace(/\[(\d{1,3})\](?![^<]*<\/code>)/g, (m, n) => byN[n] ? `<a class="cite" href="${esc(byN[n].url)}" title="${esc(byN[n].title)}">${n}</a>` : m);
   }
+  if (math.length) html = html.replace(/@@MATH(\d+)@@/g, (m, i) => mathHtml(math[+i]) ?? m);
   return DOMPurify.sanitize(html, { ADD_ATTR: ["target"] });
+}
+/** Takes the LaTeX out of a reply before Markdown sees it (Markdown would eat `\`, `_` and `*` in it):
+ *  $$…$$ and \[…\] (display), \(…\) and $…$ (inline) become @@MATHn@@ markers, code is left alone.
+ *  `$5 and $10` stays text: an inline $ must hug its formula on both sides and not touch a digit after. */
+function stashMath(text) {
+  const math = [];
+  if (!/[$\\]/.test(text)) return { text, math };
+  const re = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|(?<![\\$\w])\$(?![\s$])([^$\n]+?)(?<![\s\\])\$(?![\w$])/g;
+  const parts = text.split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g);
+  const out = parts.map((p, i) => i % 2 ? p : p.replace(re, (m, d1, d2, i1, i2) => {
+    const display = d1 !== undefined || d2 !== undefined;
+    const tex = d1 ?? d2 ?? i1 ?? i2;
+    // (an unfinished formula while streaming, or plain prose with $: kept as written)
+    if (!tex.trim()) return m;
+    math.push({ tex, display });
+    return (display ? "\n\n" : "") + `@@MATH${math.length - 1}@@` + (display ? "\n\n" : "");
+  }));
+  return { text: out.join(""), math };
+}
+function mathHtml({ tex, display }) {
+  if (typeof katex === "undefined") return null;
+  try { return katex.renderToString(tex, { displayMode: display, throwOnError: false, output: "htmlAndMathml" }); } catch { return null; }
+}
+/** Draws the ```mermaid blocks inside `root` (finished replies only); Mermaid is loaded the first time. */
+let mermaidReady = null;
+async function renderDiagrams(root) {
+  const boxes = $$(".diagram:not(.done)", root);
+  if (!boxes.length) return;
+  mermaidReady ||= new Promise((ok, fail) => {
+    const s = document.createElement("script");
+    s.src = "vendor/mermaid.min.js";
+    s.onload = () => { mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict", htmlLabels: false, flowchart: { htmlLabels: false } }); ok(); };
+    s.onerror = fail;
+    document.head.appendChild(s);
+  });
+  try { await mermaidReady; } catch { return; }
+  for (const b of boxes) {
+    b.classList.add("done");
+    const src = decodeURIComponent(b.dataset.src || "");
+    try {
+      const { svg } = await mermaid.render("mmd" + Math.random().toString(36).slice(2), src);
+      b.innerHTML = DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true }, ADD_TAGS: ["foreignObject"] });
+      b.insertAdjacentHTML("beforeend", `<button class="diagram-code" title="${esc(t("showCode"))}">${icon("code")}</button>`);
+      b.querySelector(".diagram-code").onclick = () => { b.innerHTML = `<pre><code>${esc(src)}</code></pre>`; };
+    } catch (e) {
+      b.insertAdjacentHTML("beforeend", `<div class="diagram-err">${esc(t("diagramError"))}: ${esc(String(e?.message || e).split("\n")[0])}</div>`);
+    }
+  }
 }
 document.addEventListener("click", (e) => {
   const cc = e.target.closest(".copy-code");
@@ -611,6 +671,7 @@ function welcome() {
       sg.appendChild(b);
     });
     w.appendChild(sg);
+    w.appendChild(el(`<div class="drop-tip">${icon("folder")}<span>${t("dropTip")}</span></div>`));
   }
   return w;
 }
@@ -624,6 +685,19 @@ function userEl(m) {
     a.innerHTML = `<span class="chip" style="border-style:dashed">${icon("layers")}${t("retrieved")}</span>` + ret.slice(0, 6).map((r) => `<span class="chip">${icon("file")}${esc(r.path)}:${esc(r.lines)}</span>`).join("");
     n.insertBefore(a, n.querySelector(".msg-tools"));
   }
+  // attachments: image thumbnails (loaded from data/attachments) and file chips
+  const imgs = m.meta?.images || [], files = m.meta?.files || [];
+  if (imgs.length || files.length) {
+    const a = el(`<div class="attach sent"></div>`);
+    for (const im of imgs) {
+      const th = el(`<button class="thumb" title="${esc(im.name)}">${icon("image")}</button>`);
+      attachmentUrl(im.file).then((u) => { if (u) th.innerHTML = `<img alt="${esc(im.name)}" src="${u}"/>`; });
+      th.onclick = () => attachmentUrl(im.file).then((u) => u && showImage(u, im.name));
+      a.appendChild(th);
+    }
+    for (const f of files) a.insertAdjacentHTML("beforeend", `<span class="chip" title="${esc(t("attachedChars", { n: fmtK(f.chars || 0) }))}">${icon("file")}${esc(f.name)}${f.clipped ? ` <span class="warn-ic">${icon("warn")}</span>` : ""}</span>`);
+    n.insertBefore(a, n.querySelector(".bubble"));
+  }
   if (m.meta?.research) n.querySelector(".bubble").insertAdjacentHTML("afterbegin", `<div style="font-size:11.5px;color:var(--accent);display:flex;gap:5px;align-items:center;margin-bottom:4px">${icon("telescope")}${t("research")}</div>`);
   const tools = n.querySelector(".msg-tools");
   tools.innerHTML = `<button data-a="copy" title="${t("copy")}">${icon("copy")}</button><button data-a="edit">${icon("edit")}${t("edit")}</button><button data-a="del" title="${t("deleteExchange")}">${icon("trash")}</button>`;
@@ -634,6 +708,16 @@ function userEl(m) {
     if (a === "del") deleteExchange(m);
   };
   return n;
+}
+const imgCache = new Map();
+function attachmentUrl(file) {
+  if (!imgCache.has(file)) imgCache.set(file, invoke("attachment_data", { file }).catch(() => null));
+  return imgCache.get(file);
+}
+function showImage(url, name) {
+  const m = el(`<div class="modal-bg img-view"><img alt="${esc(name)}" src="${url}"/></div>`);
+  m.onclick = () => m.remove();
+  document.body.appendChild(m);
 }
 /** Deletes this question and its whole answer (tool steps included), then redraws the chat. */
 async function deleteExchange(m) {
@@ -699,20 +783,51 @@ function assistantEl(m) {
     const md = el(`<div class="md"></div>`);
     md.innerHTML = renderMd(m.content, m.meta?.sources);
     n.appendChild(md);
+    renderDiagrams(md);
     if (m.meta?.sources?.length) {
       const s = el(`<div class="sources"></div>`);
       s.innerHTML = m.meta.sources.map((x) => `<a class="chip" href="${esc(x.url)}" title="${esc(x.url)}">${x.n}. ${esc(x.title || x.url)}</a>`).join("");
       n.appendChild(s);
     }
-    const foot = el(`<div style="display:flex;align-items:center;gap:10px" title="${esc(fmtTime(m.created))}"><div class="stats">${statsHtml(m.meta)}</div><div class="msg-tools"><button data-a="copy">${icon("copy")}</button><button data-a="regen" class="regen-btn">${icon("refresh")}${t("regenerate")}</button></div></div>`);
+    const foot = el(`<div style="display:flex;align-items:center;gap:10px" title="${esc(fmtTime(m.created))}"><div class="stats">${statsHtml(m.meta)}</div><div class="msg-tools"><button data-a="copy" title="${t("copy")}">${icon("copy")}</button>${"speechSynthesis" in window ? `<button data-a="speak" title="${t("readAloud")}">${icon("speaker")}</button>` : ""}<button data-a="regen" class="regen-btn">${icon("refresh")}${t("regenerate")}</button></div></div>`);
     foot.querySelector(".msg-tools").onclick = (e) => {
       const a = e.target.closest("button")?.dataset.a;
       if (a === "copy") { navigator.clipboard.writeText(m.content); toast(t("copied")); }
+      if (a === "speak") speak(md, e.target.closest("button"));
       if (a === "regen") regenerate();
     };
     n.appendChild(foot);
   }
   return n;
+}
+
+/** Reads a reply aloud with the system's voices (offline on Windows and macOS); pressing again stops.
+ *  Code blocks and diagrams are skipped; a Romanian reply gets a Romanian voice when one is installed. */
+let speaking = null;
+function speak(md, btn) {
+  const synth = window.speechSynthesis;
+  const was = speaking;
+  synth.cancel();
+  $$(".msg-tools button.on[data-a=speak]").forEach((b) => b.classList.remove("on"));
+  speaking = null;
+  if (was === md) return;
+  const copy = md.cloneNode(true);
+  $$(".code, .diagram, .katex-mathml", copy).forEach((x) => x.remove());
+  const text = copy.innerText.replace(/\s+\n/g, "\n").trim();
+  if (!text) return;
+  const ro = /[ăâîșşțţ]/i.test(text) || (S.settings.reply_lang === "ro");
+  const voices = synth.getVoices();
+  const voice = voices.find((v) => v.lang?.toLowerCase().startsWith(ro ? "ro" : "en") && v.localService) || voices.find((v) => v.lang?.toLowerCase().startsWith(ro ? "ro" : "en"));
+  // (long replies: one utterance per paragraph, some engines stop after ~15 s of a single one)
+  const chunks = text.split(/\n+/).filter((s) => s.trim());
+  chunks.forEach((c, i) => {
+    const u = new SpeechSynthesisUtterance(c);
+    if (voice) { u.voice = voice; u.lang = voice.lang; } else u.lang = ro ? "ro-RO" : "en-US";
+    if (i === chunks.length - 1) u.onend = () => { if (speaking === md) { speaking = null; btn.classList.remove("on"); } };
+    synth.speak(u);
+  });
+  speaking = md;
+  btn.classList.add("on");
 }
 
 const TOOL_LABEL = {
@@ -1021,7 +1136,33 @@ function setToggle(k, v) {
 function updatePlaceholder() {
   $("#input").placeholder = S.toggles.research ? t("placeholderResearch") : S.chat?.project_id ? t("placeholderProject") : t("placeholder");
 }
+/** The assistant of the open chat (or the one picked for the chat the next message creates). */
+function currentAssistant() {
+  const id = S.chat ? S.chat.assistant_id : S.pendingAssistant;
+  return (S.settings.assistants || []).find((a) => a.id === id) || null;
+}
+function assistantMenu(anchor) {
+  const cur = currentAssistant()?.id || null;
+  let html = `<div class="lbl">${t("assistant")}</div><button data-v="" class="${!cur ? "on" : ""}">${!cur ? icon("check", "ok-ic") : icon("sparkle")}<span style="flex:1">${t("assistantDefault")}</span></button>`;
+  for (const a of S.settings.assistants || []) html += `<button data-v="${esc(a.id)}" class="${a.id === cur ? "on" : ""}" title="${esc(a.instructions.slice(0, 200))}">${a.id === cur ? icon("check", "ok-ic") : icon("user")}<span style="flex:1">${esc(a.name)}</span></button>`;
+  html += `<div class="sep"></div><button data-v="@manage">${icon("gear")}${t("manageAssistants")}…</button>`;
+  popMenu(anchor, html, async (v) => {
+    if (v === "@manage") { S.settingsTab = "assistants"; return showView("settings"); }
+    const id = v || null;
+    if (S.chat) {
+      await call("set_chat_assistant", { id: S.chatId, assistantId: id });
+      S.chat.assistant_id = id;
+    } else S.pendingAssistant = id;
+    renderComposer();
+  });
+}
 function renderComposer() {
+  const as = currentAssistant();
+  $("#tAssistant").innerHTML = icon(as ? "user" : "sparkle") + esc(as ? as.name : t("assistant"));
+  $("#tAssistant").classList.toggle("on", !!as);
+  $("#attachBtn").innerHTML = icon("clip");
+  $("#attachBtn").title = t("attach");
+  renderAttachments();
   $("#tThink").innerHTML = icon("brain") + t("think");
   $("#tWeb").innerHTML = icon("globe") + t("web");
   $("#tResearch").innerHTML = icon("telescope") + t("research");
@@ -1034,6 +1175,93 @@ function renderComposer() {
   b.innerHTML = busy ? icon("stop") : icon("send");
   b.title = busy ? t("stop") : t("send");
 }
+$("#tAssistant").onclick = (e) => assistantMenu(e.currentTarget);
+$("#attachBtn").onclick = async () => {
+  const paths = await invoke("pick_files").catch(() => null);
+  if (paths?.length) addAttachmentPaths(paths);
+};
+
+// ---- attachments: files and images that go with the next message
+const IMAGE_RE = /\.(png|jpe?g|webp|gif|bmp)$/i;
+async function addAttachmentPaths(paths) {
+  const info = await call("inspect_paths", { paths });
+  for (const f of info) {
+    if (!f.exists || f.dir) continue;
+    if (S.attach.some((a) => a.path === f.path)) continue;
+    S.attach.push({ name: f.name, path: f.path, size: f.size, image: IMAGE_RE.test(f.name) });
+  }
+  renderAttachments();
+  if (S.attach.some((a) => a.image) && S.info.state === "ready" && !S.info.vision) toast(t("noVision"), true);
+}
+function renderAttachments() {
+  const bar = $("#attBar");
+  bar.classList.toggle("on", S.attach.length > 0);
+  bar.innerHTML = S.attach.map((a, i) => {
+    const pic = a.data ? `<img alt="" src="${a.data}"/>` : icon(a.image ? "image" : "file");
+    const warn = a.image && S.info.state === "ready" && !S.info.vision ? ` warn" title="${esc(t("noVision"))}` : "";
+    return `<span class="att${warn}">${pic}<span class="nm">${esc(a.name)}</span>${a.size ? `<small>${fmtBytes(a.size)}</small>` : ""}<button data-rm="${i}" title="${esc(t("remove"))}">${icon("x")}</button></span>`;
+  }).join("");
+}
+$("#attBar").onclick = (e) => {
+  const b = e.target.closest("[data-rm]");
+  if (b) { S.attach.splice(+b.dataset.rm, 1); renderAttachments(); }
+};
+// pasting a screenshot attaches it
+$("#input").addEventListener("paste", (e) => {
+  const items = [...(e.clipboardData?.items || [])].filter((i) => i.type.startsWith("image/"));
+  if (!items.length) return;
+  e.preventDefault();
+  for (const it of items) {
+    const f = it.getAsFile();
+    if (!f) continue;
+    const r = new FileReader();
+    r.onload = () => {
+      S.attach.push({ name: f.name && f.name !== "image.png" ? f.name : `${t("pastedImage")} ${S.attach.length + 1}.png`, data: r.result, size: f.size, image: true });
+      renderAttachments();
+      if (S.info.state === "ready" && !S.info.vision) toast(t("noVision"), true);
+    };
+    r.readAsDataURL(f);
+  }
+});
+
+// ---- dropping on the window: files are attached, a folder becomes the chat's workspace
+listen("tauri://drag-enter", () => {
+  $("#dropOverlay").innerHTML = `<div>${icon("clip")}<b>${t("dropTitle")}</b><span>${t("dropHint")}</span></div>`;
+  $("#dropOverlay").classList.add("on");
+});
+listen("tauri://drag-leave", () => $("#dropOverlay").classList.remove("on"));
+listen("tauri://drag-drop", async (e) => {
+  $("#dropOverlay").classList.remove("on");
+  const paths = e.payload?.paths || [];
+  if (!paths.length) return;
+  const info = await call("inspect_paths", { paths });
+  const dir = info.find((f) => f.dir);
+  const files = info.filter((f) => f.exists && !f.dir).map((f) => f.path);
+  if (dir) await workInFolder(dir.path);
+  if (S.view !== "chat") showView("chat");
+  if (files.length) await addAttachmentPaths(files);
+  input.focus();
+});
+/** "Work in this folder": the folder's project (made on first use, then indexed) holds the chat, so
+ *  the model can read, search and edit the files there (each change can be undone). An empty chat
+ *  moves into it; otherwise a new chat starts there. */
+async function workInFolder(path) {
+  const r = await call("open_folder", { folder: path });
+  const p = r.project;
+  await refreshProjects();
+  if (S.chat && !S.messages.length && !S.busy[S.chatId]) {
+    await call("set_chat_project", { id: S.chatId, projectId: p.id });
+    S.chat.project_id = p.id;
+    await refreshChats();
+    renderTopbar(); renderSidebar(); updatePlaceholder();
+  } else {
+    const c = await call("create_chat", { projectId: p.id, assistantId: S.pendingAssistant || null });
+    await refreshChats();
+    await openChat(c.id);
+  }
+  toast(t(r.created ? "folderNew" : "folderOpen", { p: p.name }));
+}
+
 $("#tThink").onclick = () => setToggle("think", !S.toggles.think);
 $("#tWeb").onclick = () => setToggle("web", !S.toggles.web);
 $("#tResearch").onclick = () => setToggle("research", !S.toggles.research);
@@ -1044,8 +1272,9 @@ input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey 
 $("#sendBtn").onclick = () => (S.busy[S.chatId] ? call("stop_generation", { chatId: S.chatId }) : send());
 
 async function send() {
-  const text = input.value.trim();
-  if (!text || S.busy[S.chatId]) return;
+  let text = input.value.trim();
+  if ((!text && !S.attach.length) || S.busy[S.chatId]) return;
+  if (!text) text = t(S.attach.every((a) => a.image) ? "lookAtImages" : "lookAtFiles");
   if (S.info.state !== "ready") {
     // unloaded (idle or by hand): bring the last model back, then send
     const last = S.settings.last_model;
@@ -1058,17 +1287,21 @@ async function send() {
       return;
     }
   }
+  if (S.attach.some((a) => a.image) && !S.info.vision) return toast(t("noVision"), true);
   if (!S.chatId) {
-    const c = await call("create_chat", { projectId: null });
+    const c = await call("create_chat", { projectId: null, assistantId: S.pendingAssistant || null });
+    S.pendingAssistant = null;
     await refreshChats();
     await openChat(c.id);
   }
+  const attachments = S.attach.map(({ name, path, data }) => ({ name, path: path || null, data: data || null }));
+  S.attach = [];
   input.value = ""; autosize();
   delete S.drafts[S.chatId]; delete S.drafts[""];
   S.busy[S.chatId] = true; renderComposer(); renderSidebar();
   S.liveCtxBase = S.ctxUsed + estTokens(text);
   const research = S.toggles.research;
-  await call("send_message", { chatId: S.chatId, text, think: S.toggles.think, web: S.toggles.web, research });
+  await call("send_message", { chatId: S.chatId, text, think: S.toggles.think, web: S.toggles.web, research, attachments });
   if (research) setToggle("research", false);
 }
 /** Drops the last user turn locally (the backend truncates and re-sends the same text). */
@@ -1169,7 +1402,8 @@ function renderModels() {
       const active = m.active && S.info.state === "ready";
       const loading = m.active && S.info.state === "starting";
       html += `<div class="card ${active ? "active" : ""}"><div class="nm">${icon("cube")}${esc(shortModel(m.file))}</div>
-        <div class="row"><span class="tag">${fmtBytes(m.size)}</span>${fitTag(m.size / 1073741824, isMoe(m.file))}${active ? `<span class="tag ok">● ${t("active")} · ${fmtK(S.info.n_ctx)} ctx</span>` : ""}${loading ? `<span class="tag warn">${t("loading")}</span>` : ""}</div>
+        <div class="row"><span class="tag">${fmtBytes(m.size)}</span>${fitTag(m.size / 1073741824, isMoe(m.file))}${m.vision ? `<span class="tag acc" title="${esc(t("visionHint"))}">${icon("image")}${t("vision")}</span>` : ""}${active ? `<span class="tag ok">● ${t("active")} · ${fmtK(S.info.n_ctx)} ctx</span>` : ""}${loading ? `<span class="tag warn">${t("loading")}</span>` : ""}</div>
+        ${!m.vision && m.repo ? (S.downloads["vision:" + m.file] && !S.downloads["vision:" + m.file].error ? `<div data-dl="vision:${esc(m.file)}">${progressHtml(S.downloads["vision:" + m.file])}</div>` : `<div data-dl="vision:${esc(m.file)}">${progressHtml(S.downloads["vision:" + m.file])}</div><button class="btn ghost" data-vision="${esc(m.file)}" title="${esc(t("addVisionHint"))}">${icon("image")}${t("addVision")}</button>`) : ""}
         <div class="row">${active ? `<button class="btn" data-unload>${icon("power")}${t("unload")}</button>` : `<button class="btn primary" data-load="${esc(m.file)}" ${loading ? "disabled" : ""}>${icon("play")}${t("load")}</button>`}
         <button class="btn danger ghost" data-del="${esc(m.file)}">${icon("trash")}${t("del")}</button></div></div>`;
     }
@@ -1234,6 +1468,17 @@ $("#modelsPage").addEventListener("click", async (e) => {
     await call("delete_model", { file: b.dataset.del }); return refreshModels();
   }
   if (b.dataset.dlrepo) return startDownload(b.dataset.dlrepo, b.dataset.dlpath);
+  if (b.dataset.vision) {
+    const file = b.dataset.vision, id = "vision:" + file;
+    S.downloads[id] = { done: 0, total: 0, speed: 0 };
+    renderModels();
+    return invoke("add_vision", { file }).then(async () => {
+      delete S.downloads[id];
+      await refreshModels();
+      // the projector is used from the next load: reload the model now if it is the one running
+      if (S.info.model === file && S.info.state === "ready") { toast(t("visionReady")); loadModel(file); } else toast(t("visionAdded"));
+    }).catch((e) => { S.downloads[id] = { error: String(e) }; renderModels(); });
+  }
   if (b.dataset.cancel) return invoke("cancel_download", { id: b.dataset.cancel });
   if (b.dataset.url) return invoke("open_url", { url: b.dataset.url });
   if (b.dataset.repo) {
@@ -1292,6 +1537,33 @@ function renderSettings() {
     html += `<h3>${icon("plug")}${t("mcpSection")}</h3>`;
     html += `<div class="field col"><div><label>${t("mcpLabel")}</label><small>${esc(t("mcpHint"))}</small></div><textarea class="inp mono" id="mcpConfig" spellcheck="false" placeholder="${esc(MCP_EXAMPLE)}">${esc(prettyJson(s.mcp_config))}</textarea><div class="btn-row"><button class="btn primary" id="mcpSave">${icon("check")}${t("mcpSave")}</button><button class="btn" id="mcpReconnect">${icon("refresh")}${t("mcpReconnect")}</button></div><div class="mcp-list" id="mcpList">${mcpListHtml()}</div></div>`;
   }
+  if (tab === "assistants") {
+    html += `<p class="lead" style="margin-top:0">${t("assistantsHint")}</p>`;
+    const temps = [["", t("assistantTempDefault")], ["0.2", "0.2 · " + t("precise")], ["0.4", "0.4"], ["0.7", "0.7"], ["1", "1.0 · " + t("creative")]];
+    for (const a of s.assistants || []) {
+      const tv = a.temperature == null ? "" : String(+a.temperature.toFixed(2));
+      html += `<div class="as-card" data-as="${esc(a.id)}">
+        <div class="as-row"><input class="inp" data-af="name" value="${esc(a.name)}" placeholder="${esc(t("assistantName"))}"/>
+          <select class="inp" data-af="temperature">${temps.map(([v, l]) => `<option value="${v}" ${v === tv ? "selected" : ""}>${esc(l)}</option>`).join("")}${tv && !temps.some(([v]) => v === tv) ? `<option value="${tv}" selected>${tv}</option>` : ""}</select>
+          <button class="btn ghost danger" data-as-del="${esc(a.id)}" title="${esc(t("del"))}">${icon("trash")}</button></div>
+        <textarea class="inp" data-af="instructions" placeholder="${esc(t("assistantInstrPh"))}">${esc(a.instructions)}</textarea></div>`;
+    }
+    html += `<div class="btn-row"><button class="btn primary" id="asAdd">${icon("plus")}${t("addAssistant")}</button></div>`;
+  }
+  if (tab === "api") {
+    const st = S.apiStatus || "";
+    const err = st.startsWith("error:");
+    html += `<p class="lead" style="margin-top:0">${t("apiHint")}</p>`;
+    html += f(t("apiEnable"), err ? `<span style="color:var(--bad)">${esc(st.slice(6).trim())}</span>` : st ? `${t("apiRunning")} <code>${esc(st)}</code>` : t("apiOff"), sw("api_enabled"));
+    html += f(t("apiPort"), t("apiPortHint"), `<input class="inp" style="min-width:100px;width:100px" type="number" min="1024" max="65535" data-k="api_port" value="${s.api_port}"/>`);
+    html += f(t("apiKeyLabel"), t("apiKeyHint"), `<div class="hf-row" style="min-width:300px"><input class="inp mono" data-k="api_key" value="${esc(s.api_key)}" placeholder="${esc(t("apiNoKey"))}"/><button class="btn" id="apiGen">${icon("refresh")}${t("apiGenerate")}</button></div>`);
+    html += f(t("apiLan"), t("apiLanHint"), sw("api_lan"));
+    if (st && !err) {
+      const base = st;
+      const ex = `curl ${base}/chat/completions -H "Content-Type: application/json"${s.api_key ? ` -H "Authorization: Bearer ${s.api_key}"` : ""} -d "{\\"model\\":\\"local\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"Hello\\"}]}"`;
+      html += `<div class="field col"><div><label>${t("apiUse")}</label><small>${t("apiUseHint")}</small></div><div class="api-box"><div><span>Base URL</span><code>${esc(base)}</code></div><div><span>API key</span><code>${esc(s.api_key || t("apiAnyKey"))}</code></div><div><span>Model</span><code>${esc(S.info.model || S.settings.last_model || "local")}</code></div></div><pre class="api-ex"><code>${esc(ex)}</code></pre></div>`;
+    }
+  }
   if (tab === "keys") {
     html += `<div class="shortcuts">${SHORTCUTS.map(([k, d]) => `<div><kbd>${k}</kbd><span>${t(d)}</span></div>`).join("")}</div>`;
   }
@@ -1313,9 +1585,20 @@ function renderSettings() {
   $("#settingsPage").innerHTML = head + `<div class="set-body">${html}</div>`;
   if (tab === "about") loadLogs();
   if (tab === "tools") invoke("mcp_status").then((m) => { S.mcp = m; renderMcpList(); }).catch(() => {});
+  if (tab === "api") refreshApiStatus();
+}
+/** The API server starts in the background: ask for its state a moment after a change. */
+async function refreshApiStatus() {
+  const st = await invoke("api_status").catch(() => "");
+  if (st !== S.apiStatus) { S.apiStatus = st; if (S.view === "settings" && S.settingsTab === "api") renderSettings(); }
+}
+/** Saves the assistants list (Settings → Assistants) without redrawing the page you are typing in. */
+async function saveAssistants() {
+  await call("set_settings", { settings: S.settings });
+  renderComposer();
 }
 /** Settings tabs: [id, icon, i18n key]. */
-const SETTINGS_TABS = [["general", "gear", "setGeneral"], ["engine", "chip", "engine"], ["chat", "sparkle", "chatSection"], ["tools", "globe", "setTools"], ["keys", "bolt", "setKeys"], ["about", "list", "about"]];
+const SETTINGS_TABS = [["general", "gear", "setGeneral"], ["engine", "chip", "engine"], ["chat", "sparkle", "chatSection"], ["assistants", "user", "assistants"], ["tools", "globe", "setTools"], ["api", "server", "apiTab"], ["keys", "bolt", "setKeys"], ["about", "list", "about"]];
 /** JSON text indented for reading (left as it is when it doesn't parse). */
 function prettyJson(text) {
   try { return text ? JSON.stringify(JSON.parse(text), null, 2) : ""; } catch { return text; }
@@ -1335,10 +1618,22 @@ function mcpListHtml() {
 function renderMcpList() { const n = $("#mcpList"); if (n) n.innerHTML = mcpListHtml(); }
 async function loadLogs() { const l = await invoke("get_logs"); const n = $("#logs"); if (n) { n.textContent = l.slice(-250).join("\n") || "—"; n.scrollTop = n.scrollHeight; } }
 $("#settingsPage").addEventListener("change", async (e) => {
+  // an assistant's field
+  const af = e.target.dataset.af;
+  if (af) {
+    const a = S.settings.assistants.find((x) => x.id === e.target.closest("[data-as]").dataset.as);
+    if (!a) return;
+    if (af === "temperature") a.temperature = e.target.value === "" ? null : parseFloat(e.target.value);
+    else a[af] = af === "name" ? e.target.value.trim() || t("assistant") : e.target.value;
+    await saveAssistants();
+    return toast(t("saved"));
+  }
   const k = e.target.dataset.k;
   if (!k) return;
   let v = e.target.type === "checkbox" ? e.target.checked : e.target.value;
-  if (["ctx_size", "n_cpu_moe", "idle_unload_min"].includes(k)) v = parseInt(v || "0", 10);
+  if (["ctx_size", "n_cpu_moe", "idle_unload_min", "api_port"].includes(k)) v = parseInt(v || "0", 10);
+  if (k === "api_port" && !(v >= 1024 && v <= 65535)) { toast(t("apiPortBad"), true); return renderSettings(); }
+  if (k === "api_lan" && v && !S.settings.api_key.trim()) S.settings.api_key = newApiKey();
   if (["temperature", "compress_at"].includes(k)) v = parseFloat(v);
   S.settings[k] = v;
   await call("set_settings", { settings: S.settings });
@@ -1347,8 +1642,10 @@ $("#settingsPage").addEventListener("change", async (e) => {
   if (k === "thinking") S.toggles.think = v;
   if (k === "ui_lang") { renderSidebar(); renderTopbar(); renderComposer(); }
   if (k === "backend") { const st = await invoke("get_state"); S.runtime = st.runtime; }
+  if (k.startsWith("api_")) { renderSettings(); setTimeout(refreshApiStatus, 400); return; }
   renderSettings();
 });
+const newApiKey = () => "lumen-" + [...crypto.getRandomValues(new Uint8Array(18))].map((b) => b.toString(16).padStart(2, "0")).join("");
 $("#settingsPage").addEventListener("input", (e) => {
   if (e.target.dataset.k === "temperature") $("#tempV").textContent = (+e.target.value).toFixed(2);
   if (e.target.dataset.k === "compress_at") $("#compV").textContent = Math.round(e.target.value * 100) + "%";
@@ -1372,6 +1669,19 @@ $("#settingsPage").addEventListener("click", async (e) => {
     catch { S.settings.mcp_config = prev; } // (invalid JSON: the error toast says why; nothing was saved)
   }
   if (id === "mcpReconnect") invoke("mcp_reconnect");
+  if (id === "apiGen") { S.settings.api_key = newApiKey(); await call("set_settings", { settings: S.settings }); renderSettings(); setTimeout(refreshApiStatus, 400); }
+  if (id === "asAdd") {
+    S.settings.assistants = [...(S.settings.assistants || []), { id: "a" + Date.now().toString(36), name: t("newAssistant"), instructions: "", temperature: null }];
+    await saveAssistants(); renderSettings();
+    $$(".as-card").pop()?.querySelector("[data-af=name]")?.select();
+  }
+  const del = e.target.closest("[data-as-del]")?.dataset.asDel;
+  if (del) {
+    const a = S.settings.assistants.find((x) => x.id === del);
+    if (!a || !(await confirmBox(t("confirmDeleteAssistant", { x: a.name }), t("del")))) return;
+    S.settings.assistants = S.settings.assistants.filter((x) => x.id !== del);
+    await saveAssistants(); renderSettings();
+  }
 });
 
 // ---------------------------------------------------------------- projects

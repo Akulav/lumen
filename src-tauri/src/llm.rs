@@ -256,7 +256,18 @@ pub fn is_connection_error(e: &anyhow::Error) -> bool {
 
 /// Rough token estimate when the server hasn't told us yet (~3.6 chars/token across EN/RO/code).
 pub fn estimate_tokens(s: &str) -> u32 {
-    (s.chars().count() as f32 / 3.6).ceil() as u32
+    (without_images(s).chars().count() as f32 / 3.6).ceil() as u32
+}
+
+/// `s` with every image `data:` URL replaced by ~1000 tokens' worth of text: an image costs the model
+/// roughly that much, not the length of its base64.
+pub fn without_images(s: &str) -> std::borrow::Cow<'_, str> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"data:image/[a-z+.\-]+;base64,[A-Za-z0-9+/=]+").expect("image regex"));
+    if !s.contains("data:image/") {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    re.replace_all(s, "x".repeat(3600))
 }
 
 #[cfg(test)]

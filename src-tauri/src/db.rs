@@ -13,7 +13,7 @@ use crate::state::{new_id, now_ms};
 pub struct Db(pub Mutex<Connection>);
 
 /// Column list matching `Db::row_chat`.
-const CHAT_COLS: &str = "id,project_id,title,created,updated,ctx_limit,ctx_used,summary,pinned";
+const CHAT_COLS: &str = "id,project_id,title,created,updated,ctx_limit,ctx_used,summary,pinned,assistant_id";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
@@ -35,6 +35,9 @@ pub struct Chat {
     pub ctx_used: u32,
     pub summary: String,
     pub pinned: bool,
+    /// The saved assistant (Settings → Assistants) this chat talks to; None = the default one.
+    #[serde(default)]
+    pub assistant_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,6 +110,10 @@ impl Db {
                 tokens INTEGER NOT NULL, created INTEGER NOT NULL);
             "#,
         )?;
+        // 0.19: chats remember their assistant
+        if !c.prepare("SELECT 1 FROM pragma_table_info('chats') WHERE name='assistant_id'")?.exists([])? {
+            c.execute("ALTER TABLE chats ADD COLUMN assistant_id TEXT", [])?;
+        }
         // progress cards left "running" by a previous session were interrupted
         c.execute(
             "UPDATE messages SET meta=REPLACE(meta,'\"state\":\"running\"','\"state\":\"cancelled\"') WHERE role='event' AND meta LIKE '%\"state\":\"running\"%'",
@@ -181,6 +188,7 @@ impl Db {
             ctx_used: 0,
             summary: String::new(),
             pinned: false,
+            assistant_id: None,
         };
         self.0.lock().execute(
             "INSERT INTO chats(id,project_id,title,created,updated) VALUES(?1,?2,?3,?4,?5)",
@@ -200,6 +208,7 @@ impl Db {
             ctx_used: r.get(6)?,
             summary: r.get(7)?,
             pinned: r.get::<_, i64>(8)? != 0,
+            assistant_id: r.get(9)?,
         })
     }
 
@@ -251,6 +260,11 @@ impl Db {
     /// Moves a chat into a project (or out of it with None).
     pub fn set_chat_project(&self, id: &str, project_id: Option<&str>) -> Result<()> {
         self.0.lock().execute("UPDATE chats SET project_id=?2 WHERE id=?1", params![id, project_id])?;
+        Ok(())
+    }
+
+    pub fn set_chat_assistant(&self, id: &str, assistant_id: Option<&str>) -> Result<()> {
+        self.0.lock().execute("UPDATE chats SET assistant_id=?2 WHERE id=?1", params![id, assistant_id])?;
         Ok(())
     }
 

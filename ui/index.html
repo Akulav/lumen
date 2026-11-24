@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Lumen</title>
   <link rel="stylesheet" href="vendor/hljs-dark.css" />
+  <link rel="stylesheet" href="vendor/katex.min.css" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -34,8 +35,11 @@
         <div class="composer-wrap">
           <button class="jump-btn" id="jumpBtn"></button>
           <div class="composer">
+            <div class="att-bar" id="attBar"></div>
             <textarea id="input" rows="1"></textarea>
             <div class="comp-row">
+              <button class="icon-btn" id="attachBtn"></button>
+              <button class="toggle" id="tAssistant"></button>
               <button class="toggle" id="tThink"></button>
               <button class="toggle" id="tWeb"></button>
               <button class="toggle research" id="tResearch"></button>
@@ -56,8 +60,10 @@
   </div>
   <div class="engine-panel" id="enginePanel"></div>
   <div class="toast-wrap" id="toasts"></div>
+  <div class="drop-overlay" id="dropOverlay"></div>
 
   <script src="vendor/marked.umd.js"></script>
+  <script src="vendor/katex.min.js"></script>
   <script src="vendor/purify.min.js"></script>
   <script src="vendor/highlight.min.js"></script>
   <script src="i18n.js"></script>

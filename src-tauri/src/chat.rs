@@ -69,6 +69,12 @@ pub fn refresh_ctx_estimate(state: &AppState, chat_id: &str) -> Result<u32> {
     Ok(used)
 }
 
+/// The saved assistant a chat talks to (None: the default one, or it was deleted since).
+pub fn chat_assistant(state: &AppState, chat: &Chat) -> Option<crate::state::Assistant> {
+    let id = chat.assistant_id.as_deref()?;
+    state.settings.read().assistants.iter().find(|a| a.id == id).cloned()
+}
+
 pub fn system_prompt(state: &AppState, chat: &Chat, project: Option<&Project>, web: bool) -> String {
     let (lang, custom) = {
         let s = state.settings.read();
@@ -76,7 +82,11 @@ pub fn system_prompt(state: &AppState, chat: &Chat, project: Option<&Project>, w
     };
     let mut sys = prompts::base(&lang, &today());
     sys.push_str(&prompts::custom_instructions(&custom));
+    if let Some(a) = chat_assistant(state, chat) {
+        sys.push_str(&prompts::assistant(&a.name, &a.instructions));
+    }
     sys.push_str(prompts::GENERAL_TOOLS);
+    sys.push_str(prompts::ATTACHMENTS);
     sys.push_str(if web { prompts::WEB_TOOLS } else { prompts::LINKS_ONLY });
     if let Some(p) = project {
         let tree = tools::tree(Path::new(&p.folder), "", 3, 220);
@@ -100,12 +110,38 @@ pub fn build_messages(state: &AppState, chat: &Chat, project: Option<&Project>, 
         .filter(|m| m.role == "tool")
         .filter_map(|m| m.meta["tool_call_id"].as_str().map(String::from))
         .collect();
+    let vision = state.info.read().vision;
     let mut out = vec![json!({"role": "system", "content": system_prompt(state, chat, project, web)})];
     for m in live {
         match m.role.as_str() {
             "user" => {
                 let c = m.meta["prompt_content"].as_str().unwrap_or(&m.content);
-                out.push(json!({"role": "user", "content": c}));
+                // attached images go along as data URLs (the same bytes every time: cache-friendly)
+                // (a model loaded without its projector would refuse the request: it is told instead)
+                let attached_images = m.meta["images"].as_array().map(Vec::len).unwrap_or(0);
+                let images: Vec<Value> = if vision {
+                    m.meta["images"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|i| image_data_url(state, i["file"].as_str()?))
+                        .map(|url| json!({"type": "image_url", "image_url": {"url": url}}))
+                        .collect()
+                } else {
+                    vec![]
+                };
+                if images.is_empty() {
+                    let c = if attached_images > 0 && !vision {
+                        format!("{c}\n\n[{attached_images} image(s) were attached here, but the model loaded now can't see images]")
+                    } else {
+                        c.to_string()
+                    };
+                    out.push(json!({"role": "user", "content": c}));
+                } else {
+                    let mut parts = vec![json!({"type": "text", "text": c})];
+                    parts.extend(images);
+                    out.push(json!({"role": "user", "content": parts}));
+                }
             }
             "assistant" => {
                 let calls: Vec<Value> = m.meta["tool_calls"]
@@ -137,6 +173,119 @@ pub struct SendOpts {
     pub think: bool,
     pub web: bool,
     pub research: bool,
+    /// files and images dropped, picked or pasted into the composer
+    pub attachments: Vec<Attachment>,
+    /// regenerate / edit: the earlier message's attachments (`images`, `attached`, `files`) carried over
+    pub keep: Option<Value>,
+}
+
+/// A file from the composer: a path on disk (dropped or picked) or a pasted image (`data:` URL).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub data: Option<String>,
+}
+
+const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
+/// Biggest image accepted (bytes) and the text of all attached files together (characters).
+const MAX_IMAGE: u64 = 20 << 20;
+const MAX_ATTACHED_CHARS: usize = 240_000;
+
+fn mime(ext: &str) -> &'static str {
+    match ext {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+/// An attached image (a file in data/attachments) as a `data:` URL for the model or the window.
+pub fn image_data_url(state: &AppState, file: &str) -> Option<String> {
+    use base64::Engine;
+    // (only plain names inside the attachments folder)
+    if file.contains(['/', '\\']) || file.starts_with('.') {
+        return None;
+    }
+    let bytes = std::fs::read(state.paths.attachments.join(file)).ok()?;
+    let ext = file.rsplit('.').next().unwrap_or("png").to_lowercase();
+    Some(format!("data:{};base64,{}", mime(&ext), base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
+/// Turns the composer's attachments into message meta: images are copied to data/attachments
+/// (`meta.images`), the text of other files is read (`meta.attached`, sent with the message, and
+/// `meta.files` for the chips the window shows). Fails with a clear message for an image when the
+/// loaded model can't see, and for files that have no readable text.
+fn take_attachments(state: &AppState, list: &[Attachment], meta: &mut Value) -> Result<()> {
+    use base64::Engine;
+    if list.is_empty() {
+        return Ok(());
+    }
+    let mut images: Vec<Value> = meta["images"].as_array().cloned().unwrap_or_default();
+    let mut files: Vec<Value> = meta["files"].as_array().cloned().unwrap_or_default();
+    let mut attached = meta["attached"].as_str().unwrap_or("").to_string();
+    for a in list {
+        let path = a.path.as_deref().map(Path::new);
+        let ext = path.and_then(|p| p.extension()).and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let is_image = a.data.as_deref().is_some_and(|d| d.starts_with("data:image/")) || IMAGE_EXT.contains(&ext.as_str());
+        if is_image {
+            if !state.info.read().vision {
+                return Err(anyhow!(
+                    "The loaded model can't see images. Open Models and press \"Add image support\" on it (a ~1 GB download), then reload it."
+                ));
+            }
+            let (bytes, ext) = match (&a.data, path) {
+                (Some(d), _) => {
+                    let (head, b64) = d.split_once(',').ok_or_else(|| anyhow!("bad pasted image"))?;
+                    let ext = head.trim_start_matches("data:image/").split(';').next().unwrap_or("png").replace("jpeg", "jpg");
+                    (base64::engine::general_purpose::STANDARD.decode(b64.trim())?, ext)
+                }
+                (None, Some(p)) => {
+                    let size = std::fs::metadata(p)?.len();
+                    if size > MAX_IMAGE {
+                        return Err(anyhow!("{} is too big ({} MB; at most {} MB)", a.name, size >> 20, MAX_IMAGE >> 20));
+                    }
+                    (std::fs::read(p)?, ext.clone())
+                }
+                _ => return Err(anyhow!("{}: nothing to read", a.name)),
+            };
+            if bytes.len() as u64 > MAX_IMAGE {
+                return Err(anyhow!("{} is too big (at most {} MB)", a.name, MAX_IMAGE >> 20));
+            }
+            let ext = if IMAGE_EXT.contains(&ext.as_str()) { ext } else { "png".into() };
+            let file = format!("{}.{ext}", crate::state::new_id());
+            std::fs::write(state.paths.attachments.join(&file), &bytes)?;
+            images.push(json!({"name": a.name, "file": file}));
+            continue;
+        }
+        let p = path.ok_or_else(|| anyhow!("{}: nothing to read", a.name))?;
+        if p.is_dir() {
+            return Err(anyhow!("{} is a folder: drop it on the window to work in it as a project", a.name));
+        }
+        let text = crate::extract::extract(p).map_err(|e| anyhow!("{} can't be read as text ({e})", a.name))?;
+        let room = MAX_ATTACHED_CHARS.saturating_sub(attached.chars().count());
+        let clipped = text.chars().count() > room;
+        let body: String = text.chars().take(room).collect();
+        attached.push_str(&format!(
+            "\n\n<attached_file name=\"{}\">\n{}{}\n</attached_file>",
+            a.name.replace('"', "'"),
+            body,
+            if clipped { "\n[… the rest of the file was cut: too long to attach whole]" } else { "" }
+        ));
+        files.push(json!({"name": a.name, "chars": text.chars().count(), "clipped": clipped}));
+    }
+    if !images.is_empty() {
+        meta["images"] = json!(images);
+    }
+    if !files.is_empty() {
+        meta["files"] = json!(files);
+        meta["attached"] = json!(attached);
+    }
+    Ok(())
 }
 
 /// Marks the chat as busy. One reply (or compression) per chat at a time: a second one would replace
@@ -192,8 +341,21 @@ pub async fn send(app: AppHandle, opts: SendOpts) -> Result<()> {
     emit(&app, &chat.id, "busy", json!({"busy": true}));
 
     let result = async {
-        // auto-retrieval for project chats
+        // attachments: the ones carried over from the message being regenerated / edited, plus new ones
         let mut meta = json!({});
+        if let Some(k) = &opts.keep {
+            for key in ["images", "files", "attached"] {
+                if !k[key].is_null() {
+                    meta[key] = k[key].clone();
+                }
+            }
+        }
+        take_attachments(&state, &opts.attachments, &mut meta)?;
+        let text = format!("{}{}", opts.text, meta["attached"].as_str().unwrap_or(""));
+        if meta["attached"].is_string() {
+            meta["prompt_content"] = json!(text);
+        }
+        // auto-retrieval for project chats
         if let Some(p) = &project {
             if let Ok(hits) = crate::rag::search(&app, &p.id, &opts.text, 6).await {
                 if !hits.is_empty() {
@@ -202,7 +364,7 @@ pub async fn send(app: AppHandle, opts: SendOpts) -> Result<()> {
                         let t: String = h.text.chars().take(1800).collect();
                         ctx.push_str(&format!("\n--- {}:{}-{} ---\n{}\n", h.path, h.line_start, h.line_end, t));
                     }
-                    meta["prompt_content"] = json!(format!("{}\n\n<retrieved_context note=\"auto-retrieved excerpts from the project, may be partial\">{}</retrieved_context>", opts.text, ctx));
+                    meta["prompt_content"] = json!(format!("{}\n\n<retrieved_context note=\"auto-retrieved excerpts from the project, may be partial\">{}</retrieved_context>", text, ctx));
                     meta["retrieved"] = json!(hits.iter().map(|h| json!({"path": h.path, "lines": format!("{}-{}", h.line_start, h.line_end)})).collect::<Vec<_>>());
                 }
             }
@@ -313,11 +475,12 @@ pub async fn regenerate(app: AppHandle, chat_id: String, think: bool, web: bool)
         let last_user = msgs.iter().rev().find(|m| m.role == "user").ok_or_else(|| anyhow!("nothing to regenerate"))?;
         let research = last_user.meta["research"].as_bool().unwrap_or(false);
         let text = last_user.content.clone();
+        let keep = last_user.meta.clone();
         state.db.truncate_from(&chat_id, last_user.seq)?;
-        Ok((text, research))
+        Ok((text, research, keep))
     })();
-    let (text, research) = report(&app, &chat_id, prepared)?;
-    send(app, SendOpts { chat_id, text, think, web, research }).await
+    let (text, research, keep) = report(&app, &chat_id, prepared)?;
+    send(app, SendOpts { chat_id, text, think, web, research, attachments: vec![], keep: Some(keep) }).await
 }
 
 /// Streams one assistant message: emits deltas to the UI and persists it.
@@ -409,7 +572,16 @@ pub async fn stream_assistant(
     Ok((msg, r))
 }
 
-/// Sampling settings (Qwen-recommended top_k/min_p) and the per-request thinking switch.
+/// Sampling settings (Qwen-recommended top_k/min_p) and the per-request thinking switch. A chat's
+/// assistant may set its own temperature.
+pub fn gen_params_for(state: &AppState, chat: &Chat, think: bool) -> Value {
+    let mut p = gen_params(state, think);
+    if let Some(t) = chat_assistant(state, chat).and_then(|a| a.temperature) {
+        p["temperature"] = json!(if think { t.clamp(0.5, 0.7) } else { t.clamp(0.0, 2.0) });
+    }
+    p
+}
+
 pub fn gen_params(state: &AppState, think: bool) -> Value {
     let s = state.settings.read();
     json!({
@@ -429,7 +601,7 @@ fn est_tokens(chars: usize) -> u32 {
 /// Estimated prompt size of the next request (messages + tool definitions).
 fn prompt_estimate(state: &AppState, chat: &Chat, project: Option<&Project>, web: bool, defs: &[Value]) -> Result<u32> {
     let msgs = build_messages(state, chat, project, web)?;
-    Ok(est_tokens(serde_json::to_string(&msgs)?.len() + serde_json::to_string(defs)?.len()))
+    Ok(est_tokens(llm::without_images(&serde_json::to_string(&msgs)?).len() + serde_json::to_string(defs)?.len()))
 }
 
 /// Keeps long tool sessions inside the window. Compression only summarises *earlier* turns, so a
@@ -529,7 +701,7 @@ async fn run_turn(app: &AppHandle, chat_id: &str, project: Option<&Project>, thi
         let _ = fit_context(&state, chat_id, project, web, &defs, (0.72, 0.5, 4))?;
         let chat = state.db.chat(chat_id)?.ok_or_else(|| anyhow!("chat deleted"))?;
         let messages = build_messages(&state, &chat, project, web)?;
-        let mut body = gen_params(&state, think);
+        let mut body = gen_params_for(&state, &chat, think);
         body["messages"] = json!(messages);
         if !defs.is_empty() {
             body["tools"] = json!(defs);
@@ -614,7 +786,7 @@ async fn run_turn(app: &AppHandle, chat_id: &str, project: Option<&Project>, thi
         emit(app, chat_id, "notice", json!({"key": "answerNow"}));
         let _ = fit_context(&state, chat_id, project, web, &defs, (0.72, 0.5, 4))?;
         let chat = state.db.chat(chat_id)?.ok_or_else(|| anyhow!("chat deleted"))?;
-        let mut body = gen_params(&state, think);
+        let mut body = gen_params_for(&state, &chat, think);
         body["messages"] = json!(final_round_messages(build_messages(&state, &chat, project, web)?));
         // the same tool list keeps the prompt prefix (and llama-server's cache) of the earlier rounds;
         // tool_choice "none" plus the note ask for text. (llama-server still parses a tool call the model
@@ -936,5 +1108,77 @@ mod tests {
         let again = fit_context(&state, &chat.id, None, false, &[], (0.72, 0.5, 4)).unwrap();
         assert_eq!(again, after);
         state.db.delete_chat(&chat.id).unwrap();
+    }
+
+    /// Attached files and images reach the prompt (text inline, images as data URLs) and survive a
+    /// reload of the chat; an image is refused while the model can't see; a chat's assistant sets the
+    /// role and the temperature.
+    #[test]
+    fn attachments_and_assistants_reach_the_prompt() {
+        use base64::Engine;
+        let state = AppState::new().unwrap();
+        let dir = std::env::temp_dir().join(format!("lumen-attach-{}", crate::state::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("notes.md");
+        std::fs::write(&note, "# Plan\nShip the release on Friday.").unwrap();
+        let png = dir.join("dot.png");
+        let png_bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/eL9NAAAAAElFTkSuQmCC")
+            .unwrap();
+        std::fs::write(&png, &png_bytes).unwrap();
+        let att = |p: &Path| Attachment { name: p.file_name().unwrap().to_string_lossy().into(), path: Some(p.to_string_lossy().into()), data: None };
+
+        // a model without its projector: images are refused with a hint, files still work
+        state.info.write().vision = false;
+        let mut meta = json!({});
+        let err = take_attachments(&state, &[att(&png)], &mut meta).unwrap_err().to_string();
+        assert!(err.contains("can't see images"), "{err}");
+        take_attachments(&state, &[att(&note)], &mut meta).unwrap();
+        assert!(meta["attached"].as_str().unwrap().contains("<attached_file name=\"notes.md\">\n# Plan\nShip the release on Friday."));
+        assert_eq!(meta["files"][0]["name"], "notes.md");
+
+        // with vision: the image is copied into data/attachments
+        state.info.write().vision = true;
+        let pasted = Attachment { name: "Pasted".into(), path: None, data: Some(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&png_bytes))) };
+        take_attachments(&state, &[att(&png), pasted], &mut meta).unwrap();
+        let images = meta["images"].as_array().unwrap().clone();
+        assert_eq!(images.len(), 2);
+        for i in &images {
+            assert_eq!(std::fs::read(state.paths.attachments.join(i["file"].as_str().unwrap())).unwrap(), png_bytes);
+        }
+        // a folder is not a file to attach
+        assert!(take_attachments(&state, &[att(&dir)], &mut json!({})).unwrap_err().to_string().contains("folder"));
+
+        // the message as the model gets it
+        let chat = state.db.create_chat(None, "New chat").unwrap();
+        meta["prompt_content"] = json!(format!("What is in these?{}", meta["attached"].as_str().unwrap()));
+        state.db.add_message(&chat.id, "user", "What is in these?", "", &meta).unwrap();
+        state.settings.write().assistants = crate::state::default_assistants();
+        state.db.set_chat_assistant(&chat.id, Some("translator")).unwrap();
+        let c = state.db.chat(&chat.id).unwrap().unwrap();
+        assert_eq!(c.assistant_id.as_deref(), Some("translator"));
+        let msgs = build_messages(&state, &c, None, false).unwrap();
+        assert!(msgs[0]["content"].as_str().unwrap().contains("# Your role in this chat: Translator"));
+        let parts = msgs[1]["content"].as_array().expect("text + images");
+        assert!(parts[0]["text"].as_str().unwrap().contains("Ship the release on Friday."));
+        assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 2);
+        assert!(parts[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,iVBOR"));
+        assert_eq!(gen_params_for(&state, &c, false)["temperature"], json!(0.3f32));
+        // an image costs ~1000 tokens in the estimate, not its base64 length
+        let est = llm::estimate_tokens(&serde_json::to_string(&msgs).unwrap());
+        assert!(est < 6000, "{est}");
+        // after switching to a model without vision the images become a note instead of a refused request
+        state.info.write().vision = false;
+        let msgs = build_messages(&state, &c, None, false).unwrap();
+        assert!(msgs[1]["content"].as_str().unwrap().contains("2 image(s) were attached here"));
+        // a deleted assistant: back to the default
+        state.settings.write().assistants.clear();
+        assert!(!build_messages(&state, &c, None, false).unwrap()[0]["content"].as_str().unwrap().contains("Your role in this chat"));
+
+        for i in &images {
+            let _ = std::fs::remove_file(state.paths.attachments.join(i["file"].as_str().unwrap()));
+        }
+        state.db.delete_chat(&chat.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

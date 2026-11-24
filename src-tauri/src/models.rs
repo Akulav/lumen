@@ -138,18 +138,23 @@ pub struct LocalModel {
     pub size: u64,
     pub modified: i64,
     pub active: bool,
+    /// its vision projector is installed: it can read images
+    pub vision: bool,
+    /// the Hugging Face repo it came from is known, so a projector can be looked for
+    pub repo: Option<String>,
 }
 
 /// GGUF files in the models folder (projectors/imatrix files and the embedding subfolder excluded).
 pub fn local_models(state: &AppState) -> Vec<LocalModel> {
     let active = state.info.read().model.clone();
+    let sources = sources(state);
     let mut v = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&state.paths.models) {
         for e in rd.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
             let lower = name.to_lowercase();
-            if !p.is_file() || !lower.ends_with(".gguf") || lower.starts_with("mmproj") || lower.contains("imatrix") {
+            if !p.is_file() || !lower.ends_with(".gguf") || lower.starts_with("mmproj") || lower.ends_with(PROJECTOR_SUFFIX) || lower.contains("imatrix") {
                 continue;
             }
             let md = e.metadata().ok();
@@ -161,6 +166,8 @@ pub fn local_models(state: &AppState) -> Vec<LocalModel> {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0),
+                vision: projector_path(state, &name).exists(),
+                repo: model_repo(&sources, &name),
                 file: name,
             });
         }
@@ -188,6 +195,7 @@ pub async fn delete_model(app: &AppHandle, file: &str) -> Result<()> {
     }
     let p = state.paths.models.join(&name);
     tokio::fs::remove_file(&p).await?;
+    let _ = tokio::fs::remove_file(projector_path(&state, &name)).await;
     let cleared = {
         let mut s = state.settings.write();
         let hit = s.last_model.as_deref() == Some(name.as_str());
@@ -232,10 +240,86 @@ pub async fn download_model(app: &AppHandle, repo: &str, path: &str) -> Result<S
     }
     let r = crate::download::download(app, &id, &name, &url, &dest, sha.as_deref(), cancel).await;
     state.downloads.lock().remove(&id);
+    if r.is_ok() {
+        remember_source(&state, &name, repo);
+    }
     if let Err(e) = &r {
         let _ = app.emit("download-progress", json!({"id": id, "label": name, "error": e.to_string()}));
     }
     r.map(|_| name)
+}
+
+/// A model's vision projector is stored next to it as `<model stem>.mmproj.gguf` (left out of the model list).
+const PROJECTOR_SUFFIX: &str = ".mmproj.gguf";
+
+pub fn projector_path(state: &AppState, model_file: &str) -> std::path::PathBuf {
+    let stem = model_file.strip_suffix(".gguf").unwrap_or(model_file);
+    state.paths.models.join(format!("{stem}{PROJECTOR_SUFFIX}"))
+}
+
+/// models/sources.json: which Hugging Face repo each downloaded model came from.
+fn sources(state: &AppState) -> Value {
+    std::fs::read_to_string(state.paths.models.join("sources.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}))
+}
+
+fn remember_source(state: &AppState, file: &str, repo: &str) {
+    let mut s = sources(state);
+    s[file] = json!(repo);
+    let _ = std::fs::write(state.paths.models.join("sources.json"), s.to_string());
+}
+
+/// The repo of a local model: remembered at download, or the catalog's for a catalog file.
+fn model_repo(sources: &Value, file: &str) -> Option<String> {
+    sources[file].as_str().map(String::from).or_else(|| catalog().into_iter().find(|c| c.file == file).map(|c| c.repo.to_string()))
+}
+
+/// The projector file to take from a repo's file list: F16 first (what llama.cpp suggests), then BF16,
+/// F32, anything else. None when the repo has none (a text-only model).
+pub fn pick_projector(paths: &[&str]) -> Option<String> {
+    let mm: Vec<&&str> = paths.iter().filter(|p| p.rsplit('/').next().is_some_and(|n| n.to_lowercase().starts_with("mmproj") && n.ends_with(".gguf"))).collect();
+    ["f16", "bf16", "f32", ""]
+        .iter()
+        // ("-f16.gguf", not "f16.gguf": BF16 ends in f16 too)
+        .find_map(|q| mm.iter().find(|p| q.is_empty() || p.to_lowercase().ends_with(&format!("-{q}.gguf"))))
+        .map(|p| p.to_string())
+}
+
+/// Downloads the vision projector for an installed model (from the repo it came from), so it can read
+/// images from the next load on. Returns the projector's file name.
+pub async fn add_vision(app: &AppHandle, model_file: &str) -> Result<String> {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let name = safe_file_name(model_file)?;
+    let repo = model_repo(&sources(&state), &name).ok_or_else(|| anyhow!("Lumen doesn't know which Hugging Face repository {name} came from"))?;
+    let tree: Value = state
+        .http
+        .get(format!("https://huggingface.co/api/models/{repo}/tree/main"))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let paths: Vec<&str> = tree.as_array().into_iter().flatten().filter_map(|f| f["path"].as_str()).collect();
+    let path = pick_projector(&paths).ok_or_else(|| anyhow!("{repo} has no vision projector (mmproj): this model reads text only"))?;
+    let dest = projector_path(&state, &name);
+    let label = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let id = format!("vision:{name}");
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut d = state.downloads.lock();
+        if d.contains_key(&id) {
+            return Err(anyhow!("already downloading"));
+        }
+        d.insert(id.clone(), cancel.clone());
+    }
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{}?download=true", urlencoding::encode(&path));
+    let sha = lfs_sha256(&tree, &path);
+    let r = crate::download::download(app, &id, &label, &url, &dest, sha.as_deref(), cancel).await;
+    state.downloads.lock().remove(&id);
+    if let Err(e) = &r {
+        let _ = app.emit("download-progress", json!({"id": id, "label": label, "error": e.to_string()}));
+    }
+    r.map(|_| label)
 }
 
 /// The SHA-256 Hugging Face publishes for a file stored with Git LFS (every GGUF is): from the repo tree
@@ -328,5 +412,17 @@ mod tests {
         assert_eq!(lfs_sha256(&tree, "Q4/model-Q4.gguf"), Some(oid));
         assert_eq!(lfs_sha256(&tree, "README.md"), None);
         assert_eq!(lfs_sha256(&tree, "missing.gguf"), None);
+    }
+
+    /// The projector of a repo (real unsloth file names): F16 preferred, none for a text-only repo.
+    #[test]
+    fn picks_the_vision_projector() {
+        assert_eq!(pick_projector(&["Qwen3.5-4B-Q4_K_M.gguf", "mmproj-BF16.gguf", "mmproj-F16.gguf", "mmproj-F32.gguf"]).as_deref(), Some("mmproj-F16.gguf"));
+        assert_eq!(pick_projector(&["a.gguf", "mmproj-BF16.gguf"]).as_deref(), Some("mmproj-BF16.gguf"));
+        assert_eq!(pick_projector(&["a.gguf", "README.md"]), None);
+        // the catalog is ordered best quality first and every entry is a real file name
+        let c = catalog();
+        assert!(c.windows(2).all(|w| w[0].id != w[1].id));
+        assert!(c.iter().all(|e| e.file.ends_with(".gguf") && e.size_gb > 0.5));
     }
 }

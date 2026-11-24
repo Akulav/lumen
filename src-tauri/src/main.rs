@@ -3,6 +3,7 @@
 //! Lumen entry point (made by Akulav): plugins, tray icon, close-to-tray, background start-up
 //! (runtime download + last-model autoload) and guaranteed shutdown of the llama-server children.
 
+mod api;
 mod audit;
 mod calc;
 mod chat;
@@ -187,6 +188,13 @@ fn main() {
             commands::quit_app,
             commands::mcp_status,
             commands::mcp_reconnect,
+            commands::set_chat_assistant,
+            commands::inspect_paths,
+            commands::open_folder,
+            commands::pick_files,
+            commands::attachment_data,
+            commands::add_vision,
+            commands::api_status,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -250,6 +258,7 @@ fn main() {
             }
 
             metrics::spawn(handle.clone());
+            api::restart(&handle);
             updater::spawn_background(handle.clone());
 
             // hassle-free start: fetch the runtime and load the last model in the background
